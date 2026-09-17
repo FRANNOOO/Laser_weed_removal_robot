@@ -1,0 +1,5 @@
+moveit_msgs/CartesianTrajectory trajectory
+---
+string msg
+---
+geometry_msgs/PoseStamped actual

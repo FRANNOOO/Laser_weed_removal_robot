@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>jaetrobi_controller_msgs</name>
+  <version>4.20.0</version>
+  <description>Controller messages for the jaetrobi robot.</description>
+
+  <maintainer email="dkloeser@atb-potsdam.de">Daniel Kloeser</maintainer>
+
+  <license>Apache License 2.0</license>
+
+
+  <author email="dkloeser@atb-potsdam.de">Daniel Kloeser</author>
+  <author>Daniel Kloeser</author>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+  <build_depend>generate_parameter_library</build_depend>
+
+  <depend>geometry_msgs</depend>
+  <depend>moveit_msgs</depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
