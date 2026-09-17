@@ -1,0 +1,9 @@
+services:
+  app_template:
+    image: gitlab-extern.atb-potsdam.de:5050/am/ros/apps/app_template
+    network_mode: host
+    environment:
+      ROS_DOMAIN_ID: 2
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+    restart: unless-stopped
+    command: ros2 launch app_template app_template.launch.py
