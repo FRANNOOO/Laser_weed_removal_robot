@@ -1,0 +1,11 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/workspace/install/jaetrobi_controller_msgs/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/workspace/install/jaetrobi_controller_msgs/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ],
+    "cmake.sourceDirectory": "/workspace/src/jaetrobi_controller_msgs"
+}
