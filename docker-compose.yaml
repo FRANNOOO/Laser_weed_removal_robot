@@ -1,9 +1,10 @@
 services:
-  app_template:
+  app_arm_control:
     image: gitlab-extern.atb-potsdam.de:5050/am/ros/apps/app_template
     network_mode: host
+    ipc: host
     environment:
-      ROS_DOMAIN_ID: 2
-      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+      ROS_DOMAIN_ID: 0
+      RMW_IMPLEMENTATION: rmw_zenoh_cpp
     restart: unless-stopped
-    command: ros2 launch app_template app_template.launch.py
+    command: ros2 launch arm_control arm_control.launch.py
