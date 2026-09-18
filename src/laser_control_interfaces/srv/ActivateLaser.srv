@@ -1,0 +1,7 @@
+# Request: duration to activate laser
+builtin_interfaces/Time timestamp  # Timestamp when request was created (for staleness detection)
+uint32 duration_us                  # Duration in microseconds to keep laser active
+---
+# Response: success status and message
+bool success        # True if activation and deactivation was successful
+string message      # Status or error message
