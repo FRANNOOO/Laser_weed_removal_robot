@@ -14,7 +14,7 @@ class ActionClientLaser():
         
         # Awaiting service availability
         while not self.client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Awaiting service /laser_control/activate_laser_timed...')
+            self._node.get_logger().info('Awaiting service /laser_control/activate_laser_timed...')
 
     def trigger_laser(self, duration_us: int):
         request = ActivateLaser.Request()
