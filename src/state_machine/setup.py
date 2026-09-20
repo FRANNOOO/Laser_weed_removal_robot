@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'pause_resume_supervisor = state_machine.pauseResumeNode:main',
+            'weed_fsm_node = state_machine.WeedStateMachineNode:main',
         ],
     },
 )

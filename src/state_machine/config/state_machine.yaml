@@ -1,0 +1,10 @@
+weed_fsm_node:
+  ros__parameters:
+    cooldown_mode: "distance"        # "distance" or "timer"
+    min_resume_distance_m: 1.0       # used when cooldown_mode: distance
+    cooldown_duration_sec: 3.0       # used when cooldown_mode: timer
+    pause_duration_sec: 5.0
+    task_timeout_sec: 30.0
+    weed_detection_topic: "weed_detection"
+    odom_topic: "odom"
+ 
