@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'weed_fsm_node = state_machine.WeedStateMachineNode:main',
+            'weed_fsm_node = state_machine.weed_fsm_node:main',
         ],
     },
 )

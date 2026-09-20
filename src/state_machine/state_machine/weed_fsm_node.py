@@ -289,7 +289,7 @@ class WeedStateMachineNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = StateMachineNode()
+    node = WeedStateMachineNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
