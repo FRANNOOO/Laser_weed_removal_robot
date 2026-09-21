@@ -14,6 +14,8 @@ from enum import Enum
 from typing import Optional
 
 from geometry_msgs.msg import Point, PointStamped, PoseStamped
+import tf2_geometry_msgs  # AGGIUNTO PER LA TRASFORMAZIONE TF
+
 import rclpy
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
@@ -296,33 +298,31 @@ class StateMachineNode(Node):
     ) -> Point:
         """
         Transform a 3D Point from source_frame to target_frame.
-
-        Falls back to the input point if frames match or TF is unavailable.
         """
         if not source_frame or source_frame == target_frame:
             return point
         try:
-            pt_stamped = PointStamped()
-            pt_stamped.header.frame_id = source_frame
-            pt_stamped.header.stamp = rclpy.time.Time().to_msg()
-            pt_stamped.point = point
-
-            transformed = self.tf_buffer.transform(
-                pt_stamped,
+            # 1. Trova la matrice di trasformazione tra i due frame
+            t = self.tf_buffer.lookup_transform(
                 target_frame,
+                source_frame,
+                rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1),
             )
+            
+            # 2. Prepara il punto Stamped
+            pt_stamped = PointStamped()
+            pt_stamped.header.frame_id = source_frame
+            pt_stamped.point = point
+            
+            # 3. Applica la trasformazione in modo esplicito e sicuro
+            transformed = tf2_geometry_msgs.do_transform_point(pt_stamped, t)
             return transformed.point
+            
         except Exception as ex:
-            if 0.20 <= point.x <= 0.60:
-                self.get_logger().debug(
-                    f'TF transform from {source_frame} to {target_frame} '
-                    f'failed ({ex}); using raw point within workspace.'
-                )
-                return point
+            # Logga chiaramente l'errore se l'albero TF è interrotto
             self.get_logger().warning(
-                f'Failed to transform weed from {source_frame} to '
-                f'{target_frame}: {ex}'
+                f'TF Error ({source_frame} -> {target_frame}): {ex}'
             )
             return point
 
