@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
+#!/usr/bin/env python3
 Navigation Systems Integration Node for Weed Removal.
 
 Coordinates pre-planned path navigation (Nav2 / opennav_coverage) with the
@@ -163,7 +164,11 @@ class NavigationCoordinatorStateMachine:
         if oldest is None:
             return False, None, trig_x
 
-        weed_x = oldest.position.x
+        # Transform weed from global odom to dynamic robot_base_frame
+        pos_local = self.node.transform_point(
+            oldest.position, 'odom', self.node.robot_base_frame
+        )
+        weed_x = pos_local.x
         self.node.publish_oldest_weed_x(weed_x)
 
         # In robot_base_link, robot drives in +X, so weed moves in -X.
@@ -620,19 +625,19 @@ class NavigationCoordinatorNode(Node):
             response.message = 'Robot navigation pause requested'
         return response
 
-    def transform_to_base_link(
+    def transform_point(
         self,
         point: Point,
         source_frame: str,
+        target_frame: str
     ) -> Point:
         """
-        Transform a 3D Point from source_frame to robot_base_frame.
+        Transform a 3D Point from source_frame to target_frame.
 
         Falls back to the input point if frames match or TF is unavailable.
         """
-        if not source_frame or source_frame == self.robot_base_frame:
+        if not source_frame or source_frame == target_frame:
             return point
-
         try:
             pt_stamped = PointStamped()
             pt_stamped.header.frame_id = source_frame
@@ -641,19 +646,20 @@ class NavigationCoordinatorNode(Node):
 
             transformed = self.tf_buffer.transform(
                 pt_stamped,
-                self.robot_base_frame,
-                timeout=rclpy.duration.Duration(seconds=0.2),
+                target_frame,
+                timeout=rclpy.duration.Duration(seconds=0.1),
             )
             return transformed.point
         except Exception as ex:
             if 0.20 <= point.x <= 0.60:
                 self.get_logger().debug(
-                    f'TF transform from {source_frame} failed ({ex}); using raw point.'
+                    f'TF transform from {source_frame} to {target_frame} '
+                    f'failed ({ex}); using raw point within workspace.'
                 )
                 return point
             self.get_logger().warning(
                 f'Failed to transform weed from {source_frame} to '
-                f'{self.robot_base_frame}: {ex}'
+                f'{target_frame}: {ex}'
             )
             return point
 
@@ -792,10 +798,10 @@ class NavigationCoordinatorNode(Node):
                 y=float(weed.position_y),
                 z=float(weed.position_z),
             )
-            pos = self.transform_to_base_link(raw_pt, msg.header.frame_id)
-            self.queue_mgr.add_or_update(weed.id, pos, timestamp=now_sec)
+            pos_odom = self.transform_point(raw_pt, msg.header.frame_id, 'odom')
+            self.queue_mgr.add_or_update(weed.id, pos_odom, timestamp=now_sec)
             self.get_logger().info(
-                f'Enqueued weed ID={weed.id} at base_link ({pos.x:.3f}, {pos.y:.3f}). '
+                f'Enqueued weed ID={weed.id} at odom ({pos_odom.x:.3f}, {pos_odom.y:.3f}). '
                 f'Total in queue: {self.queue_mgr.queue_size}'
             )
 
@@ -807,7 +813,8 @@ class NavigationCoordinatorNode(Node):
             # If coordinates were not given via WeedInfo, synthesize mock weed at back edge
             if self.queue_mgr.queue_size == 0:
                 mock_pos = Point(x=self.workspace_min_x, y=0.0, z=-0.10)
-                self.queue_mgr.add_or_update(-1, mock_pos)
+                pos_odom = self.transform_point(mock_pos, self.robot_base_frame, 'odom')
+                self.queue_mgr.add_or_update(-1, pos_odom)
             self.sm.on_weed_detected()
 
     def _on_odom(self, msg: Odometry) -> None:

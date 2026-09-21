@@ -288,14 +288,53 @@ class StateMachineNode(Node):
         self._publish_flag(self._weeding_active_pub, is_active)
         self.get_logger().info(f'State -> {new_state.value}')
 
-    def _is_point_reachable(self, pt: Point) -> bool:
+    def transform_point(
+        self,
+        point: Point,
+        source_frame: str,
+        target_frame: str
+    ) -> Point:
+        """
+        Transform a 3D Point from source_frame to target_frame.
+
+        Falls back to the input point if frames match or TF is unavailable.
+        """
+        if not source_frame or source_frame == target_frame:
+            return point
+        try:
+            pt_stamped = PointStamped()
+            pt_stamped.header.frame_id = source_frame
+            pt_stamped.header.stamp = rclpy.time.Time().to_msg()
+            pt_stamped.point = point
+
+            transformed = self.tf_buffer.transform(
+                pt_stamped,
+                target_frame,
+                timeout=rclpy.duration.Duration(seconds=0.1),
+            )
+            return transformed.point
+        except Exception as ex:
+            if 0.20 <= point.x <= 0.60:
+                self.get_logger().debug(
+                    f'TF transform from {source_frame} to {target_frame} '
+                    f'failed ({ex}); using raw point within workspace.'
+                )
+                return point
+            self.get_logger().warning(
+                f'Failed to transform weed from {source_frame} to '
+                f'{target_frame}: {ex}'
+            )
+            return point
+
+    def _is_point_reachable(self, pt_odom: Point) -> bool:
         """
         Check if coordinates fall within physical workspace boundaries.
 
-        :param pt: Target 3D coordinates.
+        :param pt_odom: Target 3D coordinates in odom frame.
         :return: True if target is reachable by the arm, False otherwise.
         """
-        valid, _ = self.arm.check_workspace(pt.x, pt.y, pt.z)
+        pt_base = self.transform_point(pt_odom, 'odom', self._robot_base_frame)
+        valid, _ = self.arm.check_workspace(pt_base.x, pt_base.y, pt_base.z)
         return valid
 
     # --- Higher-Level Queue & Stop Coordination ---
@@ -325,12 +364,16 @@ class StateMachineNode(Node):
             return False
 
         self._current_weed = next_weed
-        self.get_logger().info(
-            f'Targeting weed ID={next_weed.weed_id} at '
-            f'({next_weed.position.x:.4f}, {next_weed.position.y:.4f}, '
-            f'{next_weed.position.z:.4f})'
+        
+        pt_base = self.transform_point(
+            next_weed.position, 'odom', self._robot_base_frame
         )
-        self._enter_approx_loc(next_weed.position)
+        
+        self.get_logger().info(
+            f'Targeting weed ID={next_weed.weed_id} at base_link '
+            f'({pt_base.x:.4f}, {pt_base.y:.4f}, {pt_base.z:.4f})'
+        )
+        self._enter_approx_loc(pt_base)
         return True
 
     def _robot_stopped_callback(self, msg: Bool) -> None:
@@ -351,44 +394,6 @@ class StateMachineNode(Node):
                 'Robot stopped; checking queued weeds for removal.'
             )
             self._check_and_start_next_weed()
-
-    def _transform_to_base_link(
-        self,
-        point: Point,
-        source_frame: str,
-    ) -> Point:
-        """
-        Transform a 3D Point from source_frame to robot_base_frame.
-
-        Falls back to the input point if frames match or TF is unavailable.
-        """
-        if not source_frame or source_frame == self._robot_base_frame:
-            return point
-
-        try:
-            pt_stamped = PointStamped()
-            pt_stamped.header.frame_id = source_frame
-            pt_stamped.header.stamp = rclpy.time.Time().to_msg()
-            pt_stamped.point = point
-
-            transformed = self.tf_buffer.transform(
-                pt_stamped,
-                self._robot_base_frame,
-                timeout=rclpy.duration.Duration(seconds=0.2),
-            )
-            return transformed.point
-        except Exception as ex:
-            if 0.20 <= point.x <= 0.60:
-                self.get_logger().debug(
-                    f'TF transform from {source_frame} to {self._robot_base_frame} '
-                    f'failed ({ex}); using raw point within workspace.'
-                )
-                return point
-            self.get_logger().warning(
-                f'Failed to transform weed from {source_frame} to '
-                f'{self._robot_base_frame}: {ex}'
-            )
-            return point
 
     def _tracked_weeds_callback(self, msg: WeedInfo) -> None:
         """
@@ -413,9 +418,9 @@ class StateMachineNode(Node):
                 y=float(weed.position_y),
                 z=float(z),
             )
-            pos = self._transform_to_base_link(raw_pt, msg.header.frame_id)
+            pos_odom = self.transform_point(raw_pt, msg.header.frame_id, 'odom')
 
-            if self.queue_mgr.add_or_update(weed.id, pos):
+            if self.queue_mgr.add_or_update(weed.id, pos_odom):
                 new_count += 1
 
         if new_count > 0:
@@ -726,13 +731,16 @@ class StateMachineNode(Node):
         clamped_z = min(max(z, ws_min_z), ws_max_z)
         pos = Point(x=float(msg.x), y=float(msg.y), z=float(clamped_z))
 
+        # Transform manual input (assumed base_link) to odom
+        pos_odom = self.transform_point(pos, self._robot_base_frame, 'odom')
+
         weed_id = self._mock_weed_id_counter
         self._mock_weed_id_counter -= 1
 
-        self.queue_mgr.add_or_update(weed_id, pos)
+        self.queue_mgr.add_or_update(weed_id, pos_odom)
         self.get_logger().info(
-            f'Manually enqueued weed ID={weed_id} at '
-            f'({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}). '
+            f'Manually enqueued weed ID={weed_id} at odom '
+            f'({pos_odom.x:.3f}, {pos_odom.y:.3f}, {pos_odom.z:.3f}). '
             f'Queue size: {self.queue_mgr.queue_size}'
         )
         self._publish_queue_size()
