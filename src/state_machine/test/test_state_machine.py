@@ -43,6 +43,7 @@ def sm_node(rclpy_context):
     node._arm_send_goal_pub = MagicMock()
     node._trigger_yolo_pub = MagicMock()
     node._removal_finished_pub = MagicMock()
+    node._all_weeds_treated_pub = MagicMock()
     node.arm.move_to_position = MagicMock(return_value=True)
     yield node
     node.destroy_node()
@@ -73,9 +74,9 @@ def test_simulated_precise_detection_applies_offset(sm_node):
 def test_simulated_precise_detection_clamps_to_workspace(sm_node):
     """Verify precise coordinates are clamped within arm workspace limits."""
     sm_node._state = State.DETECT_PRECISE
-    # Place at upper x boundary (0.400) and upper y boundary (0.070)
+    # Place at upper x boundary and test clamping against workspace_max
     sm_node._approx_loc = Point(x=0.400, y=0.070, z=-0.100)
-    sm_node._precise_offset_x = 0.050  # 450mm would exceed 400mm max
+    sm_node._precise_offset_x = 0.050  # 450mm exceeds 400mm max
     sm_node._precise_offset_y = -0.010
 
     sm_node._on_simulated_precise_detection()
@@ -123,3 +124,36 @@ def test_transform_to_base_link_fallback(sm_node):
     # Frame with no TF returns point within workspace fallback
     fallback = sm_node._transform_to_base_link(pt, 'unknown_optical_frame')
     assert fallback.x == pytest.approx(0.350)
+
+
+def test_weed_treatment_failure_publishes_all_weeds_treated(sm_node):
+    """Verify failure during motion handles error and signals navigation to resume."""
+    sm_node._robot_stopped = True
+    sm_node._state = State.IDLE
+    weed_pt = Point(x=0.350, y=0.010, z=-0.100)
+    sm_node.queue_mgr.add_or_update(42, weed_pt)
+
+    # Start weed treatment
+    started = sm_node._check_and_start_next_weed()
+    assert started is True
+    assert sm_node._current_weed.weed_id == 42
+
+    # Simulate failure (e.g. motion aborted)
+    sm_node._on_weed_treatment_failed('Motion aborted by server')
+
+    assert 42 in sm_node._failed_weed_ids_for_stop
+    assert sm_node._state == State.IDLE
+    assert sm_node._current_weed is None
+    # No more reachable weeds -> publishes all_weeds_treated=True
+    sm_node._all_weeds_treated_pub.publish.assert_called()
+
+
+def test_robot_resumed_clears_failed_weeds_for_stop(sm_node):
+    """Verify resuming navigation clears the failed weeds set for the next stop."""
+    from std_msgs.msg import Bool
+    sm_node._failed_weed_ids_for_stop.add(42)
+
+    msg = Bool(data=False)
+    sm_node._robot_stopped_callback(msg)
+
+    assert len(sm_node._failed_weed_ids_for_stop) == 0

@@ -131,3 +131,64 @@ def test_get_oldest_queued_weed(queue_mgr):
     active = queue_mgr.get_all_active_weeds()
     assert len(active) == 2
     assert [w.weed_id for w in active] == [102, 103]
+
+
+def test_update_positions_tf_and_dead_reckoning(queue_mgr):
+    """Test dynamic coordinate updating via TF and dead-reckoning fallback."""
+    raw_pt = Point(x=10.0, y=5.0, z=-0.10)
+    base_pos = Point(x=0.42, y=0.01, z=-0.10)
+
+    # Enqueue weed with raw_position, raw_frame_id, and odom_pose
+    queue_mgr.add_or_update(
+        55,
+        base_pos,
+        raw_position=raw_pt,
+        raw_frame_id='map',
+        odom_pose=(0.0, 0.0, 0.0),
+    )
+
+    # 1. TF transform function succeeds
+    def mock_tf(pt, frame):
+        if frame == 'map':
+            return Point(x=0.36, y=0.01, z=-0.10)
+        return None
+
+    queue_mgr.update_positions(
+        tf_transform_fn=mock_tf, current_odom_pose=(0.05, 0.0, 0.0)
+    )
+    assert queue_mgr.get_weed(55).position.x == pytest.approx(0.36)
+
+    # 2. TF transform fails, dead-reckoning fallback is used
+    # Vehicle has advanced from (0.05, 0, 0) to (0.10, 0, 0)
+    # In robot_base_link, advancing forward (+dx_robot) increases weed X:
+    # 0.36 + (0.10 - 0.05) = 0.41
+    queue_mgr.update_positions(
+        tf_transform_fn=lambda pt, frame: None,
+        current_odom_pose=(0.10, 0.0, 0.0),
+    )
+    assert queue_mgr.get_weed(55).position.x == pytest.approx(0.41)
+
+
+def test_purge_unreachable(queue_mgr):
+    """Test purging weeds that moved past max workspace threshold."""
+    queue_mgr.add_or_update(1, Point(x=0.10, y=0.0, z=-0.10))
+    queue_mgr.add_or_update(2, Point(x=0.45, y=0.0, z=-0.10))
+
+    purged = queue_mgr.purge_unreachable(max_x_threshold=0.42)
+    assert purged == 1
+    assert queue_mgr.is_queued(1) is True
+    assert queue_mgr.is_queued(2) is False
+
+
+def test_get_oldest_reachable_candidate(queue_mgr):
+    """Test retrieving oldest candidate that has not passed max threshold."""
+    # Weed 1 passed past back edge
+    queue_mgr.add_or_update(1, Point(x=0.46, y=0.0, z=-0.10))
+    # Weed 2 is reachable near back edge
+    queue_mgr.add_or_update(2, Point(x=0.38, y=0.0, z=-0.10))
+    # Weed 3 is approaching front edge
+    queue_mgr.add_or_update(3, Point(x=0.15, y=0.0, z=-0.10))
+
+    candidate = queue_mgr.get_oldest_reachable_candidate(max_x_threshold=0.42)
+    assert candidate is not None
+    assert candidate.weed_id == 2

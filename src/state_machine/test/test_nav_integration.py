@@ -65,15 +65,17 @@ class MockCoordinatorNode:
         # Geometry and thresholds
         self.workspace_min_x = 0.290
         self.workspace_max_x = 0.400
-        self.back_edge_margin_x = 0.020
+        self.back_edge_margin_x = 0.040
         self.use_velocity_lookahead = True
-        self.stop_delay_sec = 0.20
-        self.min_resume_distance_m = 0.30
+        self.stop_delay_sec = 0.80
+        self.min_resume_distance_m = 0.05
         self.task_timeout_sec = 120.0
 
         # Robot state
         self.current_position = (0.0, 0.0)
         self.current_velocity = (0.0, 0.0)
+        self.current_yaw = 0.0
+        self.transform_to_base_link = MagicMock(side_effect=lambda pt, frame: pt)
 
         # Service clients
         self.pause_client = MagicMock()
@@ -156,6 +158,12 @@ class MockCoordinatorNode:
         """Mark watchdog as stopped."""
         self.watchdog_stopped = True
 
+    def create_timer(self, period: float, callback) -> MagicMock:
+        """Return a mock timer (does not fire automatically in tests)."""
+        timer = MagicMock()
+        timer.cancel = MagicMock()
+        return timer
+
 
 @pytest.fixture
 def mock_node():
@@ -171,21 +179,21 @@ def coordinator_sm(mock_node):
 
 def test_compute_stop_trigger_x(coordinator_sm, mock_node):
     """Test stop trigger X calculation with various velocities."""
-    # Stationary: min_x + margin = 0.290 + 0.020 = 0.310
-    assert coordinator_sm.compute_stop_trigger_x(0.0) == pytest.approx(0.310)
+    # Stationary: max_x - margin = 0.400 - 0.040 = 0.360
+    assert coordinator_sm.compute_stop_trigger_x(0.0) == pytest.approx(0.360)
 
-    # Moving forward at 0.1 m/s: 0.310 + (0.1 * 0.2) = 0.330
-    assert coordinator_sm.compute_stop_trigger_x(0.10) == pytest.approx(0.330)
+    # Moving forward at 0.1 m/s: 0.360 - (0.1 * 0.8) = 0.280
+    assert coordinator_sm.compute_stop_trigger_x(0.10) == pytest.approx(0.280)
 
     # Moving backward or zero velocity: no negative lookahead
-    assert coordinator_sm.compute_stop_trigger_x(-0.05) == pytest.approx(0.310)
+    assert coordinator_sm.compute_stop_trigger_x(-0.05) == pytest.approx(0.360)
 
-    # Very fast forward: clamped to workspace_max_x (0.400)
-    assert coordinator_sm.compute_stop_trigger_x(1.0) == pytest.approx(0.400)
+    # Very fast forward: clamped to min_trigger_x (0.150)
+    assert coordinator_sm.compute_stop_trigger_x(1.0) == pytest.approx(0.150)
 
     # Disabled lookahead
     mock_node.use_velocity_lookahead = False
-    assert coordinator_sm.compute_stop_trigger_x(0.10) == pytest.approx(0.310)
+    assert coordinator_sm.compute_stop_trigger_x(0.10) == pytest.approx(0.360)
 
 
 def test_back_edge_trigger_empty_queue(coordinator_sm):
@@ -193,38 +201,51 @@ def test_back_edge_trigger_empty_queue(coordinator_sm):
     should_stop, weed_x, trig_x = coordinator_sm.check_back_edge_trigger()
     assert should_stop is False
     assert weed_x is None
-    assert trig_x == pytest.approx(0.310)
+    assert trig_x == pytest.approx(0.360)
 
 
 def test_back_edge_trigger_weed_at_front_edge(coordinator_sm, mock_node):
-    """Test that a weed at front edge (0.380m) does NOT trigger stopping."""
-    mock_node.queue_mgr.add_or_update(1, Point(x=0.380, y=0.0, z=-0.10))
+    """Test that a weed at front edge (0.150m) does NOT trigger stopping."""
+    mock_node.queue_mgr.add_or_update(1, Point(x=0.150, y=0.0, z=-0.10))
 
     should_stop, weed_x, trig_x = coordinator_sm.check_back_edge_trigger()
     assert should_stop is False
-    assert weed_x == pytest.approx(0.380)
-    assert trig_x == pytest.approx(0.310)
+    assert weed_x == pytest.approx(0.150)
+    assert trig_x == pytest.approx(0.360)
 
     # Triggering on_weed_detected should remain in IDLE
     coordinator_sm.on_weed_detected()
     assert coordinator_sm.state == NavigationState.IDLE
 
 
-def test_multi_weed_queue_and_back_edge_stop(coordinator_sm, mock_node):
-    """Test queueing weeds and stopping only when oldest reaches back edge."""
-    # Weed 1 enters at 0.38m
-    mock_node.queue_mgr.add_or_update(10, Point(x=0.380, y=0.01, z=-0.10))
+def test_back_edge_trigger_ignores_weeds_past_workspace(coordinator_sm, mock_node):
+    """Test that weeds that have already moved past workspace_max_x do NOT trigger stopping."""
+    # Weed 1 is at 0.430m (beyond workspace_max_x = 0.415)
+    mock_node.queue_mgr.add_or_update(1, Point(x=0.430, y=0.0, z=-0.10))
+
+    should_stop, weed_x, trig_x = coordinator_sm.check_back_edge_trigger()
+    assert should_stop is False
+    assert weed_x is None
+
     coordinator_sm.on_weed_detected()
     assert coordinator_sm.state == NavigationState.IDLE
 
-    # Weed 2 enters behind it at 0.395m
-    mock_node.queue_mgr.add_or_update(11, Point(x=0.395, y=-0.02, z=-0.10))
+
+def test_multi_weed_queue_and_back_edge_stop(coordinator_sm, mock_node):
+    """Test queueing weeds and stopping only when oldest reaches back edge."""
+    # Weed 1 enters at 0.15m (camera view)
+    mock_node.queue_mgr.add_or_update(10, Point(x=0.150, y=0.01, z=-0.10))
+    coordinator_sm.on_weed_detected()
+    assert coordinator_sm.state == NavigationState.IDLE
+
+    # Weed 2 enters behind it at 0.12m
+    mock_node.queue_mgr.add_or_update(11, Point(x=0.120, y=-0.02, z=-0.10))
     coordinator_sm.on_weed_detected()
     assert coordinator_sm.state == NavigationState.IDLE
     assert mock_node.queue_mgr.queue_size == 2
 
-    # Oldest weed (10) approaches back edge (x=0.305m <= trig_x=0.310m)
-    mock_node.queue_mgr.add_or_update(10, Point(x=0.305, y=0.01, z=-0.10))
+    # Oldest weed (10) approaches back edge (x=0.365m >= trig_x=0.360m)
+    mock_node.queue_mgr.add_or_update(10, Point(x=0.365, y=0.01, z=-0.10))
     coordinator_sm.on_weed_detected()
 
     # Should transition to PAUSE to stop robot
@@ -235,7 +256,7 @@ def test_multi_weed_queue_and_back_edge_stop(coordinator_sm, mock_node):
 def test_full_fsm_cycle(coordinator_sm, mock_node):
     """Test full cycle: IDLE -> PAUSE -> TASK_EXE -> RESUMING -> IDLE."""
     # 1. Enqueue weed at back edge
-    mock_node.queue_mgr.add_or_update(1, Point(x=0.300, y=0.0, z=-0.10))
+    mock_node.queue_mgr.add_or_update(1, Point(x=0.365, y=0.0, z=-0.10))
     coordinator_sm.on_weed_detected()
     assert coordinator_sm.state == NavigationState.PAUSE
 
@@ -271,20 +292,20 @@ def test_odometry_cooldown_distance(coordinator_sm, mock_node):
     assert coordinator_sm.state == NavigationState.IDLE
     assert coordinator_sm.is_cooldown_active is True
 
-    # Add a weed near back edge during cooldown
-    mock_node.queue_mgr.add_or_update(20, Point(x=0.300, y=0.0, z=-0.10))
+    # Add a weed near back edge during cooldown (>= 0.360m)
+    mock_node.queue_mgr.add_or_update(20, Point(x=0.365, y=0.0, z=-0.10))
     coordinator_sm.on_weed_detected()
     # Must NOT stop during cooldown
     assert coordinator_sm.state == NavigationState.IDLE
 
-    # Robot moves 0.15m (< 0.30m required)
-    mock_node.current_position = (1.15, 2.0)
+    # Robot moves 0.02m (< 0.05m required)
+    mock_node.current_position = (1.02, 2.0)
     coordinator_sm.on_odom_update()
     assert coordinator_sm.is_cooldown_active is True
     assert coordinator_sm.state == NavigationState.IDLE
 
-    # Robot moves past 0.30m (total 0.35m from origin)
-    mock_node.current_position = (1.35, 2.0)
+    # Robot moves past 0.05m (total 0.06m from origin)
+    mock_node.current_position = (1.06, 2.0)
     coordinator_sm.on_odom_update()
 
     # Cooldown cleared and pending weed evaluated -> PAUSE triggered!
@@ -294,7 +315,7 @@ def test_odometry_cooldown_distance(coordinator_sm, mock_node):
 
 def test_watchdog_timeout_leads_to_error(coordinator_sm, mock_node):
     """Test that weed removal watchdog timeout transitions to ERROR state."""
-    mock_node.queue_mgr.add_or_update(1, Point(x=0.300, y=0.0, z=-0.10))
+    mock_node.queue_mgr.add_or_update(1, Point(x=0.385, y=0.0, z=-0.10))
     coordinator_sm.on_weed_detected()
     coordinator_sm.on_pause_confirmed()
     assert coordinator_sm.state == NavigationState.TASK_EXE
@@ -306,7 +327,7 @@ def test_watchdog_timeout_leads_to_error(coordinator_sm, mock_node):
 
 def test_service_failures_lead_to_error(coordinator_sm, mock_node):
     """Test that Nav2 service failures transition to ERROR state."""
-    mock_node.queue_mgr.add_or_update(1, Point(x=0.300, y=0.0, z=-0.10))
+    mock_node.queue_mgr.add_or_update(1, Point(x=0.385, y=0.0, z=-0.10))
     coordinator_sm.on_weed_detected()
     assert coordinator_sm.state == NavigationState.PAUSE
 

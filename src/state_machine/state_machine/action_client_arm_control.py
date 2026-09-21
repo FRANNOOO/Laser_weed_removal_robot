@@ -133,10 +133,17 @@ class CartesianActionClient:
         trajectory.header.frame_id = self.BASE_FRAME
         trajectory.tracked_frame = self.TRACKED_FRAME
 
+        # Clamp strictly within physical limits to guard against floating-point roundoff
+        ws_min = self.workspace_min
+        ws_max = self.workspace_max
+        clamped_x = min(max(float(x), ws_min[0]), ws_max[0])
+        clamped_y = min(max(float(y), ws_min[1]), ws_max[1])
+        clamped_z = min(max(float(z), ws_min[2]), ws_max[2])
+
         point = CartesianTrajectoryPoint()
-        point.point.pose.position.x = float(x)
-        point.point.pose.position.y = float(y)
-        point.point.pose.position.z = float(z)
+        point.point.pose.position.x = clamped_x
+        point.point.pose.position.y = clamped_y
+        point.point.pose.position.z = clamped_z
         point.point.pose.orientation.x = 0.0
         point.point.pose.orientation.y = 0.0
         point.point.pose.orientation.z = 0.0

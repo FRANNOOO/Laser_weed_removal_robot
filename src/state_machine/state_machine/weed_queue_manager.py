@@ -21,8 +21,9 @@ removed weed IDs, and coordinates sequential targeting of reachable weeds.
 """
 
 from dataclasses import dataclass
+import math
 import time
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from geometry_msgs.msg import Point
 
@@ -34,6 +35,10 @@ class QueuedWeed:
     weed_id: int
     position: Point
     timestamp: float
+    initial_position: Optional[Point] = None
+    raw_position: Optional[Point] = None
+    raw_frame_id: str = ''
+    odom_pose_at_detection: Optional[Tuple[float, float, float]] = None
 
 
 class WeedQueueManager:
@@ -81,7 +86,10 @@ class WeedQueueManager:
         self,
         weed_id: int,
         position: Point,
-        timestamp: Optional[float] = None
+        timestamp: Optional[float] = None,
+        raw_position: Optional[Point] = None,
+        raw_frame_id: str = '',
+        odom_pose: Optional[Tuple[float, float, float]] = None,
     ) -> bool:
         """
         Add newly detected weed or update position of existing weed.
@@ -91,23 +99,43 @@ class WeedQueueManager:
         :param weed_id: Unique integer identifier of the weed.
         :param position: 3D coordinates (Point) in the robot base frame.
         :param timestamp: Detection timestamp (defaults to system time).
+        :param raw_position: Original Point before any transformation.
+        :param raw_frame_id: Source frame ID of the detection message.
+        :param odom_pose: Vehicle odometry pose (x, y, yaw) at detection time.
         :return: True if new weed added to queue, False if ignored or updated.
         """
         if self.is_removed(weed_id):
             return False
 
         ts = timestamp if timestamp is not None else time.time()
+        orig_pt = raw_position if raw_position is not None else Point(
+            x=position.x, y=position.y, z=position.z
+        )
 
         if weed_id in self._queue:
             # Update existing weed position and timestamp
             self._queue[weed_id].position = position
             self._queue[weed_id].timestamp = ts
+            if self._queue[weed_id].initial_position is None:
+                self._queue[weed_id].initial_position = Point(
+                    x=position.x, y=position.y, z=position.z
+                )
+            if raw_position is not None:
+                self._queue[weed_id].raw_position = raw_position
+            if raw_frame_id:
+                self._queue[weed_id].raw_frame_id = raw_frame_id
+            if odom_pose is not None:
+                self._queue[weed_id].odom_pose_at_detection = odom_pose
             return False
 
         self._queue[weed_id] = QueuedWeed(
             weed_id=weed_id,
             position=position,
             timestamp=ts,
+            initial_position=Point(x=position.x, y=position.y, z=position.z),
+            raw_position=orig_pt,
+            raw_frame_id=raw_frame_id,
+            odom_pose_at_detection=odom_pose,
         )
         return True
 
@@ -143,6 +171,96 @@ class WeedQueueManager:
         if not self._queue:
             return None
         return next(iter(self._queue.values()))
+
+    def get_oldest_reachable_candidate(
+        self,
+        max_x_threshold: float
+    ) -> Optional[QueuedWeed]:
+        """
+        Return the oldest queued weed that has not passed beyond max_x_threshold.
+
+        :param max_x_threshold: Maximum allowable X coordinate before weed is past workspace.
+        :return: Oldest candidate QueuedWeed, or None if none found.
+        """
+        for weed in self._queue.values():
+            if weed.position.x <= max_x_threshold:
+                return weed
+        return None
+
+    def update_positions(
+        self,
+        tf_transform_fn: Optional[Callable[[Point, str], Optional[Point]]] = None,
+        current_odom_pose: Optional[Tuple[float, float, float]] = None,
+    ) -> None:
+        """
+        Update estimated base_link positions for all active queued weeds.
+
+        Tries TF transform first if a transform function and raw_frame_id are
+        available. Falls back to odometry dead-reckoning displacement when TF
+        fails or is unavailable.
+
+        :param tf_transform_fn: Optional callable transforming (Point, source_frame) -> Point.
+        :param current_odom_pose: Current vehicle odometry pose (x, y, yaw).
+        """
+        for weed in self._queue.values():
+            updated = False
+            raw_pt = weed.raw_position or weed.position
+
+            # 1. Try TF transform if frame is known
+            if tf_transform_fn is not None and weed.raw_frame_id:
+                try:
+                    tf_pos = tf_transform_fn(raw_pt, weed.raw_frame_id)
+                    if tf_pos is not None:
+                        weed.position = tf_pos
+                        weed.initial_position = Point(
+                            x=tf_pos.x, y=tf_pos.y, z=tf_pos.z
+                        )
+                        if current_odom_pose is not None:
+                            weed.odom_pose_at_detection = current_odom_pose
+                        updated = True
+                except Exception:
+                    updated = False
+
+            # 2. Odometry dead-reckoning displacement fallback
+            if (
+                not updated
+                and current_odom_pose is not None
+                and weed.odom_pose_at_detection is not None
+            ):
+                x_now, y_now, _ = current_odom_pose
+                x_det, y_det, yaw_det = weed.odom_pose_at_detection
+
+                dx_world = x_now - x_det
+                dy_world = y_now - y_det
+
+                # Forward displacement along vehicle heading at detection
+                dx_robot = dx_world * math.cos(yaw_det) + dy_world * math.sin(yaw_det)
+                dy_robot = -dx_world * math.sin(yaw_det) + dy_world * math.cos(yaw_det)
+
+                # In robot_base_link (rotated 180 deg about Z relative to base_link):
+                # Vehicle forward motion (+dx_robot) causes stationary ground points
+                # to advance in +X (towards the manipulator arm).
+                init_pt = weed.initial_position or weed.position
+                weed.position = Point(
+                    x=init_pt.x + dx_robot,
+                    y=init_pt.y + dy_robot,
+                    z=init_pt.z,
+                )
+
+    def purge_unreachable(self, max_x_threshold: float) -> int:
+        """
+        Remove weeds that have moved completely past the reachable workspace.
+
+        :param max_x_threshold: X coordinate above which weeds are permanently unreachable.
+        :return: Count of purged weeds.
+        """
+        to_remove = [
+            wid for wid, w in self._queue.items()
+            if w.position.x > max_x_threshold
+        ]
+        for wid in to_remove:
+            self._queue.pop(wid, None)
+        return len(to_remove)
 
     def get_all_active_weeds(self) -> List[QueuedWeed]:
         """

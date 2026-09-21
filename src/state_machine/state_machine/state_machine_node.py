@@ -11,9 +11,12 @@ iterating through all reachable weeds during a single stop.
 """
 
 from enum import Enum
-from typing import Optional
+import math
+import time
+from typing import List, Optional, Set, Tuple
 
 from geometry_msgs.msg import Point, PointStamped, PoseStamped
+from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
@@ -21,6 +24,7 @@ from state_machine.action_client_arm_control import CartesianActionClient
 from state_machine.action_client_laser import ActionClientLaser
 from state_machine.weed_queue_manager import QueuedWeed, WeedQueueManager
 from std_msgs.msg import Bool, Int32, String
+import tf2_geometry_msgs  # noqa: F401
 from tf2_ros import Buffer, TransformListener
 
 try:
@@ -67,6 +71,7 @@ class StateMachineNode(Node):
         self.declare_parameter('precise_offset_x', 0.003)
         self.declare_parameter('precise_offset_y', -0.002)
         self.declare_parameter('robot_base_frame', 'robot_base_link')
+        self.declare_parameter('odom_topic', '/odom')
 
         # Read parameters
         self._duration_sec = float(self.get_parameter('duration_sec').value)
@@ -97,6 +102,9 @@ class StateMachineNode(Node):
         self._robot_base_frame = str(
             self.get_parameter('robot_base_frame').value
         )
+        self._odom_topic = str(
+            self.get_parameter('odom_topic').value
+        )
 
         ws_min = (
             float(self.get_parameter('workspace_min_x').value),
@@ -125,7 +133,12 @@ class StateMachineNode(Node):
         self.queue_mgr = WeedQueueManager()
         self._robot_stopped = self._auto_start_weeding
         self._current_weed: Optional[QueuedWeed] = None
+        self._failed_weed_ids_for_stop: Set[int] = set()
         self._mock_weed_id_counter = -1
+
+        # Odometry state for dynamic weed queue tracking
+        self._current_position: Optional[Tuple[float, float]] = None
+        self._current_yaw: float = 0.0
 
         # Internal state & target locations
         self._state = State.IDLE
@@ -204,6 +217,17 @@ class StateMachineNode(Node):
         )
         self.get_logger().info(
             f'Subscribed to robot stopped topic: {self._robot_stopped_topic}'
+        )
+
+        # Subscriptions: Odometry for queue position tracking
+        self._odom_sub = self.create_subscription(
+            Odometry,
+            self._odom_topic,
+            self._odom_callback,
+            10,
+        )
+        self.get_logger().info(
+            f'Subscribed to odometry topic: {self._odom_topic}'
         )
 
         # Backward-compatible manual injection subscriptions
@@ -292,13 +316,28 @@ class StateMachineNode(Node):
         """
         Check if coordinates fall within physical workspace boundaries.
 
+        Uses target_z_default for the Z check because after TF transform
+        from map to robot_base_link, weed Z is at ground level (~-0.5m)
+        which is outside the arm's focal height range [-0.140, -0.080].
+        The arm always operates at a fixed Z height, so only X and Y
+        determine whether a weed is reachable.
+
         :param pt: Target 3D coordinates.
         :return: True if target is reachable by the arm, False otherwise.
         """
-        valid, _ = self.arm.check_workspace(pt.x, pt.y, pt.z)
+        z = self._target_z_default
+        valid, _ = self.arm.check_workspace(pt.x, pt.y, z)
         return valid
 
     # --- Higher-Level Queue & Stop Coordination ---
+
+    def _get_reachable_weeds_for_current_stop(self) -> List[QueuedWeed]:
+        """Return active queued weeds reachable in workspace and not failed during current stop."""
+        return [
+            w for w in self.queue_mgr.get_all_active_weeds()
+            if w.weed_id not in self._failed_weed_ids_for_stop
+            and self._is_point_reachable(w.position)
+        ]
 
     def _check_and_start_next_weed(self) -> bool:
         """
@@ -315,15 +354,38 @@ class StateMachineNode(Node):
         if self._state != State.IDLE:
             return False
 
-        next_weed = self.queue_mgr.get_next_reachable(self._is_point_reachable)
-        if next_weed is None:
+        if self._current_position is not None:
+            current_pose = (
+                self._current_position[0],
+                self._current_position[1],
+                self._current_yaw,
+            )
+            self.queue_mgr.update_positions(None, current_pose)
+
+        reachable = self._get_reachable_weeds_for_current_stop()
+        if not reachable:
             if self.queue_mgr.queue_size > 0:
+                coords = [
+                    f'ID={w.weed_id}:({w.position.x:.3f},{w.position.y:.3f})'
+                    for w in self.queue_mgr.get_all_active_weeds()
+                ]
                 self.get_logger().info(
                     f'{self.queue_mgr.queue_size} weed(s) in queue, '
-                    'none reachable in workspace.'
+                    f'none reachable in workspace. [{", ".join(coords)}]'
                 )
+            # If robot is stopped and no weeds are reachable (or queue
+            # is empty), signal completion so nav_integration_node can
+            # resume navigation instead of waiting for the watchdog
+            # timeout.
+            if self._robot_stopped:
+                self.get_logger().info(
+                    'Robot stopped but no reachable weeds. '
+                    'Publishing all_weeds_treated=True to resume nav.'
+                )
+                self._publish_flag(self._all_weeds_treated_pub, True)
             return False
 
+        next_weed = reachable[0]
         self._current_weed = next_weed
         self.get_logger().info(
             f'Targeting weed ID={next_weed.weed_id} at '
@@ -332,6 +394,33 @@ class StateMachineNode(Node):
         )
         self._enter_approx_loc(next_weed.position)
         return True
+
+    def _on_weed_treatment_failed(self, reason: str) -> None:
+        """
+        Handle failure during weed treatment (motion aborted, rejected, or invalid).
+
+        Marks the current weed as failed for the current stop, returns to IDLE,
+        and either targets the next reachable weed or signals navigation to resume.
+        """
+        failed_weed = self._current_weed
+        failed_id = failed_weed.weed_id if failed_weed else None
+        self.get_logger().error(
+            f'Weed treatment failed for weed ID={failed_id}: {reason}'
+        )
+        if failed_id is not None:
+            self._failed_weed_ids_for_stop.add(failed_id)
+        self._current_weed = None
+
+        self._enter_idle()
+
+        # Check if another reachable weed can be treated at this stop
+        started = self._check_and_start_next_weed()
+        if not started and self._robot_stopped:
+            self.get_logger().info(
+                'No remaining reachable weeds after failure; '
+                'publishing all_weeds_treated=True to resume nav.'
+            )
+            self._publish_flag(self._all_weeds_treated_pub, True)
 
     def _robot_stopped_callback(self, msg: Bool) -> None:
         """
@@ -345,12 +434,29 @@ class StateMachineNode(Node):
             f'Robot stopped flag updated: {self._robot_stopped}'
         )
 
+        if not self._robot_stopped:
+            self._failed_weed_ids_for_stop.clear()
+
         if (self._robot_stopped and not prev_stopped and
                 self._state == State.IDLE):
+            self._failed_weed_ids_for_stop.clear()
             self.get_logger().info(
                 'Robot stopped; checking queued weeds for removal.'
             )
-            self._check_and_start_next_weed()
+            if self._current_position is not None:
+                current_pose = (
+                    self._current_position[0],
+                    self._current_position[1],
+                    self._current_yaw,
+                )
+                self.queue_mgr.update_positions(None, current_pose)
+            started = self._check_and_start_next_weed()
+            if not started:
+                self.get_logger().info(
+                    'No reachable weeds to treat upon robot stop; '
+                    'publishing all_weeds_treated=True.'
+                )
+                self._publish_flag(self._all_weeds_treated_pub, True)
 
     def _transform_to_base_link(
         self,
@@ -363,7 +469,11 @@ class StateMachineNode(Node):
         Falls back to the input point if frames match or TF is unavailable.
         """
         if not source_frame or source_frame == self._robot_base_frame:
-            return point
+            # Still ensure Z is within operating limits
+            ws_min_z = self.arm.workspace_min[2]
+            ws_max_z = self.arm.workspace_max[2]
+            z = point.z if (ws_min_z <= point.z <= ws_max_z) else self._target_z_default
+            return Point(x=point.x, y=point.y, z=float(z))
 
         try:
             pt_stamped = PointStamped()
@@ -374,21 +484,58 @@ class StateMachineNode(Node):
             transformed = self.tf_buffer.transform(
                 pt_stamped,
                 self._robot_base_frame,
-                timeout=rclpy.duration.Duration(seconds=0.2),
+                timeout=rclpy.duration.Duration(seconds=0.05),
             )
-            return transformed.point
+            pt_out = transformed.point
+            ws_min_z = self.arm.workspace_min[2]
+            ws_max_z = self.arm.workspace_max[2]
+            if not (ws_min_z <= pt_out.z <= ws_max_z):
+                pt_out.z = self._target_z_default
+            return pt_out
         except Exception as ex:
+            ws_min_z = self.arm.workspace_min[2]
+            ws_max_z = self.arm.workspace_max[2]
+            fallback_z = point.z if (ws_min_z <= point.z <= ws_max_z) else self._target_z_default
+            fallback_pt = Point(x=point.x, y=point.y, z=float(fallback_z))
             if 0.20 <= point.x <= 0.60:
                 self.get_logger().debug(
                     f'TF transform from {source_frame} to {self._robot_base_frame} '
                     f'failed ({ex}); using raw point within workspace.'
                 )
-                return point
+                return fallback_pt
             self.get_logger().warning(
                 f'Failed to transform weed from {source_frame} to '
                 f'{self._robot_base_frame}: {ex}'
             )
-            return point
+            return fallback_pt
+
+    def _odom_callback(self, msg: Odometry) -> None:
+        """
+        Handle odometry update to track vehicle position.
+
+        :param msg: Odometry message with vehicle pose.
+        """
+        self._current_position = (
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y,
+        )
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self._current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        current_pose = (
+            self._current_position[0],
+            self._current_position[1],
+            self._current_yaw,
+        )
+        self.queue_mgr.update_positions(
+            None,
+            current_pose,
+        )
+        self.queue_mgr.purge_unreachable(
+            self.arm.workspace_max[0] + 0.15
+        )
 
     def _tracked_weeds_callback(self, msg: WeedInfo) -> None:
         """
@@ -396,32 +543,41 @@ class StateMachineNode(Node):
 
         :param msg: WeedInfo message with detected weeds and IDs.
         """
+        now_sec = time.time()
+        current_odom = None
+        if self._current_position is not None:
+            current_odom = (
+                self._current_position[0],
+                self._current_position[1],
+                self._current_yaw,
+            )
+
         new_count = 0
         for weed in msg.weeds:
             if self.queue_mgr.is_removed(weed.id):
                 continue
 
-            # Assign default z height if 0.0 or outside valid workspace
-            z = weed.position_z
-            ws_min_z = self.arm.workspace_min[2]
-            ws_max_z = self.arm.workspace_max[2]
-            if abs(z) < 1e-3 or not (ws_min_z <= z <= ws_max_z):
-                z = self._target_z_default
-
             raw_pt = Point(
                 x=float(weed.position_x),
                 y=float(weed.position_y),
-                z=float(z),
+                z=float(weed.position_z),
             )
             pos = self._transform_to_base_link(raw_pt, msg.header.frame_id)
 
-            if self.queue_mgr.add_or_update(weed.id, pos):
+            if self.queue_mgr.add_or_update(
+                weed.id,
+                pos,
+                timestamp=now_sec,
+                raw_position=raw_pt,
+                raw_frame_id=msg.header.frame_id,
+                odom_pose=current_odom,
+            ):
                 new_count += 1
 
-        if new_count > 0:
+        if len(msg.weeds) > 0:
             self.get_logger().info(
-                f'Enqueued {new_count} new weed(s). '
-                f'Total in queue: {self.queue_mgr.queue_size}'
+                f'Received {len(msg.weeds)} weed detection(s). '
+                f'New: {new_count}, Total active in queue: {self.queue_mgr.queue_size}'
             )
             self._publish_queue_size()
 
@@ -453,18 +609,26 @@ class StateMachineNode(Node):
 
         :param target: Approximate coordinates to position the arm.
         """
+        # Clamp Z to valid arm workspace range. After TF transform from
+        # map, weed Z is at ground level in robot_base_link (~-0.5m) but
+        # the arm operates at a fixed focal height [-0.140, -0.080].
+        ws_min_z = self.arm.workspace_min[2]
+        ws_max_z = self.arm.workspace_max[2]
+        clamped_z = target.z
+        if not (ws_min_z <= clamped_z <= ws_max_z):
+            clamped_z = self._target_z_default
+        target = Point(x=target.x, y=target.y, z=float(clamped_z))
+
         self._approx_loc = target
         self._set_state(State.APPROX_LOC)
         self._publish_flag(self._ready_for_removal_pub, False)
 
         valid, reason = self.arm.check_workspace(target.x, target.y, target.z)
         if not valid:
-            self.get_logger().error(
-                f'Approx target ({target.x:.3f}, {target.y:.3f}, '
-                f'{target.z:.3f}) outside workspace: {reason}'
+            self._on_weed_treatment_failed(
+                f'Approx target ({target.x:.3f}, {target.y:.3f}, {target.z:.3f}) '
+                f'outside workspace: {reason}'
             )
-            self._current_weed = None
-            self._enter_idle()
             return
 
         self._publish_flag(self._arm_send_goal_pub, True)
@@ -477,12 +641,14 @@ class StateMachineNode(Node):
             self._publish_flag(self._arm_send_goal_pub, False)
             if result is None or result.status != 4:
                 status_code = result.status if result else 'REJECTED'
-                self.get_logger().error(
-                    f'Motion to approx_loc failed with status {status_code}. '
-                    'Returning to Idle.'
+                msg_text = (
+                    result.result.msg
+                    if (result and hasattr(result, 'result') and result.result)
+                    else ''
                 )
-                self._current_weed = None
-                self._enter_idle()
+                self._on_weed_treatment_failed(
+                    f'Motion to approx_loc failed with status {status_code}: {msg_text}'
+                )
                 return
 
             self.get_logger().info(
@@ -498,11 +664,7 @@ class StateMachineNode(Node):
         )
         self._publish_flag(self._arm_send_goal_pub, False)
         if not sent:
-            self.get_logger().error(
-                'Failed to send goal to approx_loc. Returning to Idle.'
-            )
-            self._current_weed = None
-            self._enter_idle()
+            self._on_weed_treatment_failed('Failed to send goal to approx_loc')
 
     def _enter_detect_precise(self) -> None:
         """Enter Detect_Precise state upon arm arrival at approx position."""
@@ -563,17 +725,24 @@ class StateMachineNode(Node):
 
         :param target: Precise coordinates aligned with laser aim.
         """
+        # Clamp Z to valid arm workspace range (same rationale as
+        # _enter_approx_loc).
+        ws_min_z = self.arm.workspace_min[2]
+        ws_max_z = self.arm.workspace_max[2]
+        clamped_z = target.z
+        if not (ws_min_z <= clamped_z <= ws_max_z):
+            clamped_z = self._target_z_default
+        target = Point(x=target.x, y=target.y, z=float(clamped_z))
+
         self._precise_loc = target
         self._set_state(State.MOVE_TO_PRECISE)
 
         valid, reason = self.arm.check_workspace(target.x, target.y, target.z)
         if not valid:
-            self.get_logger().error(
-                f'Precise target ({target.x:.3f}, {target.y:.3f}, '
-                f'{target.z:.3f}) outside workspace: {reason}'
+            self._on_weed_treatment_failed(
+                f'Precise target ({target.x:.3f}, {target.y:.3f}, {target.z:.3f}) '
+                f'outside workspace: {reason}'
             )
-            self._current_weed = None
-            self._enter_idle()
             return
 
         self._publish_flag(self._arm_send_goal_pub, True)
@@ -586,12 +755,14 @@ class StateMachineNode(Node):
             self._publish_flag(self._arm_send_goal_pub, False)
             if result is None or result.status != 4:
                 status_code = result.status if result else 'REJECTED'
-                self.get_logger().error(
-                    f'Motion to precise_loc failed with status {status_code}. '
-                    'Returning to Idle.'
+                msg_text = (
+                    result.result.msg
+                    if (result and hasattr(result, 'result') and result.result)
+                    else ''
                 )
-                self._current_weed = None
-                self._enter_idle()
+                self._on_weed_treatment_failed(
+                    f'Motion to precise_loc failed with status {status_code}: {msg_text}'
+                )
                 return
 
             self.get_logger().info(
@@ -606,11 +777,7 @@ class StateMachineNode(Node):
         )
         self._publish_flag(self._arm_send_goal_pub, False)
         if not sent:
-            self.get_logger().error(
-                'Failed to send goal to precise_loc. Returning to Idle.'
-            )
-            self._current_weed = None
-            self._enter_idle()
+            self._on_weed_treatment_failed('Failed to send goal to precise_loc')
 
     def _enter_lasering(self) -> None:
         """Enter Lasering state and activate laser for specified duration."""
@@ -689,12 +856,13 @@ class StateMachineNode(Node):
                 self.get_logger().warn(
                     f'Weed ID={wid} was NOT marked removed due to laser error.'
                 )
+                self._failed_weed_ids_for_stop.add(wid)
 
             self._current_weed = None
 
         # Check if more reachable weeds exist during this stop
         can_continue = (self._robot_stopped or self._auto_start_weeding)
-        has_more = self.queue_mgr.has_reachable_weeds(self._is_point_reachable)
+        has_more = len(self._get_reachable_weeds_for_current_stop()) > 0
 
         if can_continue and has_more:
             self.get_logger().info(

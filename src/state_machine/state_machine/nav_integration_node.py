@@ -37,6 +37,7 @@ from rclpy.node import Node
 from state_machine.weed_queue_manager import WeedQueueManager
 from std_msgs.msg import Bool, Float32, Int32, String
 from std_srvs.srv import SetBool, Trigger
+import tf2_geometry_msgs  # noqa: F401
 from tf2_ros import Buffer, TransformListener
 
 try:
@@ -135,19 +136,20 @@ class NavigationCoordinatorStateMachine:
         """
         Compute the X coordinate threshold that triggers robot stopping.
 
-        Stopping target is the back edge plus a safety margin:
-            x_target = workspace_min_x + back_edge_margin_x
+        Stopping target is the back edge minus a safety margin:
+            x_target = workspace_max_x - back_edge_margin_x
         Taking forward velocity v_x and stopping delay dt_stop into account:
-            x_trigger = x_target + (v_x * dt_stop if use_velocity_lookahead else 0)
+            x_trigger = x_target - (v_x * dt_stop if use_velocity_lookahead else 0)
         """
-        x_target = self.node.workspace_min_x + self.node.back_edge_margin_x
+        x_target = self.node.workspace_max_x - self.node.back_edge_margin_x
         lookahead = 0.0
         if self.node.use_velocity_lookahead and velocity_x > 0.0:
             lookahead = velocity_x * self.node.stop_delay_sec
 
-        x_trigger = x_target + lookahead
-        # Clamp to front of workspace
-        return min(x_trigger, self.node.workspace_max_x)
+        x_trigger = x_target - lookahead
+        # Clamp within observable range before workspace back edge
+        min_trigger_x = 0.150
+        return max(min_trigger_x, min(x_trigger, self.node.workspace_max_x))
 
     def check_back_edge_trigger(self) -> Tuple[bool, Optional[float], float]:
         """
@@ -155,10 +157,12 @@ class NavigationCoordinatorStateMachine:
 
         Returns (should_stop, oldest_weed_x, trigger_x).
         """
-        oldest = self.node.queue_mgr.get_oldest_queued_weed()
         vx = self.node.current_velocity[0]
         trig_x = self.compute_stop_trigger_x(vx)
         self.node.publish_stop_trigger_x(trig_x)
+
+        max_reachable_x = self.node.workspace_max_x
+        oldest = self.node.queue_mgr.get_oldest_reachable_candidate(max_reachable_x)
 
         if oldest is None:
             return False, None, trig_x
@@ -166,9 +170,9 @@ class NavigationCoordinatorStateMachine:
         weed_x = oldest.position.x
         self.node.publish_oldest_weed_x(weed_x)
 
-        # In robot_base_link, robot drives in +X, so weed moves in -X.
-        # Weed is near/past back-edge trigger when weed_x <= trig_x.
-        should_stop = (weed_x <= trig_x)
+        # In robot_base_link, as robot drives forward, stationary ground points move in +X.
+        # Weed is near/past back-edge trigger when weed_x >= trig_x.
+        should_stop = (weed_x >= trig_x)
         return should_stop, weed_x, trig_x
 
     def on_weed_detected(self) -> None:
@@ -182,16 +186,17 @@ class NavigationCoordinatorStateMachine:
         if should_stop:
             x_str = f'{weed_x:.3f}' if weed_x is not None else 'N/A'
             self.node.get_logger().info(
-                f'Oldest weed at x={x_str}m <= trigger {trig_x:.3f}m! '
+                f'Oldest weed at x={x_str}m >= trigger {trig_x:.3f}m! '
                 'Triggering pause near back edge...'
             )
             self._transition(NavigationState.PAUSE)
         else:
-            oldest = self.node.queue_mgr.get_oldest_queued_weed()
+            max_reachable_x = self.node.workspace_max_x
+            oldest = self.node.queue_mgr.get_oldest_reachable_candidate(max_reachable_x)
             wid = oldest.weed_id if oldest else '?'
             x_str = f'{weed_x:.3f}' if weed_x is not None else 'N/A'
             self.node.get_logger().info(
-                f'Oldest weed ID={wid} at x={x_str}m > trigger {trig_x:.3f}m. '
+                f'Oldest weed ID={wid} at x={x_str}m < trigger {trig_x:.3f}m. '
                 f'Queue size={self.node.queue_mgr.queue_size}. Continuing navigation.'
             )
 
@@ -222,6 +227,31 @@ class NavigationCoordinatorStateMachine:
 
     def on_odom_update(self) -> None:
         """Handle odometry update for cooldown and dynamic back-edge check."""
+        current_pose = None
+        if self.node.current_position is not None:
+            current_pose = (
+                self.node.current_position[0],
+                self.node.current_position[1],
+                self.node.current_yaw,
+            )
+        self.node.queue_mgr.update_positions(
+            None,
+            current_pose,
+        )
+        self.node.queue_mgr.purge_unreachable(
+            self.node.workspace_max_x + 0.15
+        )
+
+        # Telemetry: publish trigger_x and oldest_weed_x on every odom update
+        vx = self.node.current_velocity[0]
+        trig_x = self.compute_stop_trigger_x(vx)
+        self.node.publish_stop_trigger_x(trig_x)
+
+        max_reachable_x = self.node.workspace_max_x
+        oldest = self.node.queue_mgr.get_oldest_reachable_candidate(max_reachable_x)
+        if oldest is not None:
+            self.node.publish_oldest_weed_x(oldest.position.x)
+
         if self.state != NavigationState.IDLE:
             return
 
@@ -328,9 +358,27 @@ class NavigationCoordinatorStateMachine:
 
     # -- ERROR ----------------------------------------------------------------
     def _enter_error(self) -> None:
-        """Enter ERROR state."""
+        """Enter ERROR state with auto-recovery after 5 seconds."""
         self.node.stop_hold_position()
-        self.node.get_logger().error('Entered ERROR state. Awaiting operator recovery.')
+        self.node.publish_robot_stopped(False)
+        self.node.get_logger().error(
+            'Entered ERROR state. Auto-recovering to RESUMING in 5s...'
+        )
+        self._error_recovery_timer = self.node.create_timer(
+            5.0, self._on_error_auto_recover
+        )
+
+    def _on_error_auto_recover(self) -> None:
+        """Auto-recover from ERROR state by transitioning to RESUMING."""
+        if hasattr(self, '_error_recovery_timer') and self._error_recovery_timer:
+            self._error_recovery_timer.cancel()
+            self._error_recovery_timer = None
+        if self.state != NavigationState.ERROR:
+            return
+        self.node.get_logger().info(
+            'Auto-recovering from ERROR state -> RESUMING.'
+        )
+        self._transition(NavigationState.RESUMING)
 
     def on_recovered(self) -> None:
         """Recover from ERROR state back to IDLE."""
@@ -367,13 +415,13 @@ class NavigationCoordinatorNode(Node):
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('workspace_min_x', 0.290)
         self.declare_parameter('workspace_max_x', 0.400)
-        self.declare_parameter('back_edge_margin_x', 0.020)
-        self.declare_parameter('stop_delay_sec', 0.20)
+        self.declare_parameter('back_edge_margin_x', 0.040)
+        self.declare_parameter('stop_delay_sec', 0.80)
         self.declare_parameter('use_velocity_lookahead', True)
-        self.declare_parameter('min_resume_distance_m', 0.30)
+        self.declare_parameter('min_resume_distance_m', 0.05)
         self.declare_parameter('task_timeout_sec', 60.0)
         self.declare_parameter('mock_nav2', False)
-        self.declare_parameter('provide_start_stop_service', True)
+        self.declare_parameter('provide_start_stop_service', False)
         self.declare_parameter('robot_base_frame', 'robot_base_link')
         self.declare_parameter('hold_position_on_pause', True)
 
@@ -416,6 +464,7 @@ class NavigationCoordinatorNode(Node):
         # Odometry state
         self.current_position: Optional[Tuple[float, float]] = None
         self.current_velocity: Tuple[float, float] = (0.0, 0.0)
+        self.current_yaw: float = 0.0
 
         # Local weed tracking queue
         self.queue_mgr = WeedQueueManager()
@@ -642,7 +691,7 @@ class NavigationCoordinatorNode(Node):
             transformed = self.tf_buffer.transform(
                 pt_stamped,
                 self.robot_base_frame,
-                timeout=rclpy.duration.Duration(seconds=0.2),
+                timeout=rclpy.duration.Duration(seconds=0.05),
             )
             return transformed.point
         except Exception as ex:
@@ -667,7 +716,7 @@ class NavigationCoordinatorNode(Node):
 
         pause_triggered = False
 
-        # Try Trigger client (/navigate_complete_coverage/pause)
+        # Try Trigger client (/navigate_complete_coverage/pause) first
         if self.pause_client.service_is_ready():
             pause_triggered = True
             req = Trigger.Request()
@@ -675,19 +724,18 @@ class NavigationCoordinatorNode(Node):
             future.add_done_callback(
                 lambda f: self._on_service_response(f, 'pause')
             )
-        else:
-            self.get_logger().debug(
-                f'Nav2 pause service {self.pause_service_name} not immediately available.'
-            )
-
-        # Try SetBool client (/start_stop_robot) only if not hosting it
-        if not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
+        # Fall back to SetBool client (/start_stop_robot) only if direct pause is unavailable
+        elif not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
             pause_triggered = True
             req_bool = SetBool.Request()
             req_bool.data = False
             future_bool = self.start_stop_client.call_async(req_bool)
             future_bool.add_done_callback(
                 lambda f: self._on_set_bool_response(f, 'start_stop_pause')
+            )
+        else:
+            self.get_logger().debug(
+                f'Nav2 pause service {self.pause_service_name} not immediately available.'
             )
 
         if not pause_triggered:
@@ -698,7 +746,7 @@ class NavigationCoordinatorNode(Node):
             self.sm.on_pause_confirmed()
 
     def call_resume_services(self) -> None:
-        """Invoke available resume services (Trigger and SetBool)."""
+        """Invoke available resume services (Trigger or SetBool)."""
         if self.mock_nav2:
             self.get_logger().info('[MOCK] Mocking resume service confirmation')
             self.sm.on_resume_confirmed()
@@ -706,7 +754,7 @@ class NavigationCoordinatorNode(Node):
 
         resume_triggered = False
 
-        # Try Trigger client (/navigate_complete_coverage/resume)
+        # Try Trigger client (/navigate_complete_coverage/resume) first
         if self.resume_client.service_is_ready():
             resume_triggered = True
             req = Trigger.Request()
@@ -714,19 +762,18 @@ class NavigationCoordinatorNode(Node):
             future.add_done_callback(
                 lambda f: self._on_service_response(f, 'resume')
             )
-        else:
-            self.get_logger().debug(
-                f'Nav2 resume service {self.resume_service_name} not immediately available.'
-            )
-
-        # Try SetBool client (/start_stop_robot) only if not hosting it
-        if not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
+        # Fall back to SetBool client (/start_stop_robot) only if direct resume is unavailable
+        elif not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
             resume_triggered = True
             req_bool = SetBool.Request()
             req_bool.data = True
             future_bool = self.start_stop_client.call_async(req_bool)
             future_bool.add_done_callback(
                 lambda f: self._on_set_bool_response(f, 'start_stop_resume')
+            )
+        else:
+            self.get_logger().debug(
+                f'Nav2 resume service {self.resume_service_name} not immediately available.'
             )
 
         if not resume_triggered:
@@ -786,6 +833,13 @@ class NavigationCoordinatorNode(Node):
     def _on_tracked_weeds(self, msg: 'WeedInfo') -> None:
         """Handle incoming WeedInfo message and update queue coordinates."""
         now_sec = time.time()
+        current_odom = None
+        if self.current_position is not None:
+            current_odom = (
+                self.current_position[0],
+                self.current_position[1],
+                self.current_yaw,
+            )
         for weed in msg.weeds:
             raw_pt = Point(
                 x=float(weed.position_x),
@@ -793,7 +847,14 @@ class NavigationCoordinatorNode(Node):
                 z=float(weed.position_z),
             )
             pos = self.transform_to_base_link(raw_pt, msg.header.frame_id)
-            self.queue_mgr.add_or_update(weed.id, pos, timestamp=now_sec)
+            self.queue_mgr.add_or_update(
+                weed.id,
+                pos,
+                timestamp=now_sec,
+                raw_position=raw_pt,
+                raw_frame_id=msg.header.frame_id,
+                odom_pose=current_odom,
+            )
             self.get_logger().info(
                 f'Enqueued weed ID={weed.id} at base_link ({pos.x:.3f}, {pos.y:.3f}). '
                 f'Total in queue: {self.queue_mgr.queue_size}'
@@ -806,7 +867,11 @@ class NavigationCoordinatorNode(Node):
         if msg.data:
             # If coordinates were not given via WeedInfo, synthesize mock weed at back edge
             if self.queue_mgr.queue_size == 0:
-                mock_pos = Point(x=self.workspace_min_x, y=0.0, z=-0.10)
+                mock_pos = Point(
+                    x=self.workspace_max_x - self.back_edge_margin_x,
+                    y=0.0,
+                    z=-0.10,
+                )
                 self.queue_mgr.add_or_update(-1, mock_pos)
             self.sm.on_weed_detected()
 
@@ -820,6 +885,11 @@ class NavigationCoordinatorNode(Node):
             msg.twist.twist.linear.x,
             msg.twist.twist.linear.y,
         )
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
         self.sm.on_odom_update()
 
     def _on_all_weeds_treated(self, msg: Bool) -> None:
