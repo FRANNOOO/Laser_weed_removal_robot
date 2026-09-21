@@ -9,6 +9,7 @@ weed removal sequence.
 
 from enum import Enum
 import sys
+import time
 from typing import Optional
 
 from geometry_msgs.msg import Point, PoseStamped
@@ -299,6 +300,12 @@ class StateMachineNode(Node):
         :param duration_sec: Arm movement duration in seconds.
         :return: True if completed without ERROR state.
         """
+        self.get_logger().info('Waiting 2 seconds for robot controllers to activate...')
+        
+        start_time = time.time()
+        while rclpy.ok() and (time.time() - start_time) < 2.0:
+            rclpy.spin_once(self, timeout_sec=0.1)
+
         success = self.execute_weed_removal(
             x, y, z, duration_sec=duration_sec, laser_duration_us=laser_duration_us
         )

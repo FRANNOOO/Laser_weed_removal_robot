@@ -262,7 +262,7 @@ class CartesianActionClient:
             self._logger.info('Cartesian trajectory goal was ACCEPTED. Executing motion...')
             self._goal_handle = goal_handle
             res_future = goal_handle.get_result_async()
-
+            
             def internal_result(res_f: Future):
                 self._is_moving = False
                 res = res_f.result()
