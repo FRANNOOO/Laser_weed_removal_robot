@@ -154,12 +154,28 @@ class CartesianActionClient:
         if not HAS_CONTROLLER_MANAGER or self._list_controllers_client is None:
             return
 
-        if not self._list_controllers_client.service_is_ready():
-            return
+        def _do_query() -> None:
+            req = ListControllers.Request()
+            future = self._list_controllers_client.call_async(req)
+            future.add_done_callback(self._on_list_controllers_response)
 
-        req = ListControllers.Request()
-        future = self._list_controllers_client.call_async(req)
-        future.add_done_callback(self._on_list_controllers_response)
+        if self._list_controllers_client.service_is_ready():
+            _do_query()
+        else:
+            self._logger.info(
+                'Waiting for /controller_manager/list_controllers service...'
+            )
+            retry_timer = None
+
+            def _check_and_call() -> None:
+                nonlocal retry_timer
+                if self._list_controllers_client.service_is_ready():
+                    if retry_timer is not None:
+                        retry_timer.cancel()
+                        retry_timer = None
+                    _do_query()
+
+            retry_timer = self._node.create_timer(1.0, _check_and_call)
 
     def _on_list_controllers_response(self, future: Future) -> None:
         try:
@@ -169,7 +185,9 @@ class CartesianActionClient:
             return
 
         required = ['jaetrobi_controller', 'joint_trajectory_controller']
-        active_controllers = {c.name for c in response.controller if c.state == 'active'}
+        active_controllers = {
+            c.name for c in response.controller if c.state == 'active'
+        }
         to_activate = [c for c in required if c not in active_controllers]
 
         if (
@@ -177,17 +195,22 @@ class CartesianActionClient:
             self._switch_controller_client and
             self._switch_controller_client.service_is_ready()
         ):
-            self._logger.info(f'Controllers {to_activate} inactive. Activating...')
+            self._logger.info(
+                f'Controllers {to_activate} inactive. Activating...'
+            )
             switch_req = SwitchController.Request()
             switch_req.activate_controllers = to_activate
             switch_req.deactivate_controllers = []
-            switch_req.strictness = SwitchController.Request.STRICT
+            switch_req.strictness = SwitchController.Request.BEST_EFFORT
             switch_req.activate_asap = False
             switch_req.timeout = MsgDuration(sec=1, nanosec=0)
-            switch_future = self._switch_controller_client.call_async(switch_req)
+            switch_future = self._switch_controller_client.call_async(
+                switch_req
+            )
             switch_future.add_done_callback(
                 lambda f: self._logger.info(
-                    f'Controller activation result: {f.result().ok if f.result() else False}'
+                    f'Controller activation result: '
+                    f'{f.result().ok if f.result() else False}'
                 )
             )
 

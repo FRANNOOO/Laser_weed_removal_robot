@@ -15,6 +15,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'),
             glob(os.path.join('launch', '*launch.[pxy][yma]*'))),
+        ('lib/' + package_name, ['scripts/state_machine_node']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -28,11 +29,6 @@ setup(
     extras_require={
         'test': [
             'pytest',
-        ],
-    },
-    entry_points={
-        'console_scripts': [
-            'state_machine_node = state_machine.state_machine_node:main',
         ],
     },
 )

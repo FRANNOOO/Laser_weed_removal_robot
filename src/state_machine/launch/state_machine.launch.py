@@ -1,5 +1,7 @@
 """Launch file for the weed removal state machine node."""
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
 from launch.substitutions import LaunchConfiguration
@@ -8,24 +10,14 @@ from launch_ros.actions import Node
 
 def generate_launch_description() -> LaunchDescription:
     """Generate launch description for state_machine_node."""
+    domain_id_arg = DeclareLaunchArgument(
+        'domain_id',
+        default_value=os.environ.get('ROS_DOMAIN_ID', '1'),
+        description='ROS domain ID (1 for simulation, 2 for robot)'
+    )
     set_rmw = SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_zenoh_cpp')
-    set_domain_id = SetEnvironmentVariable('ROS_DOMAIN_ID', '0')
+    set_domain_id = SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id'))
 
-    target_x_arg = DeclareLaunchArgument(
-        'target_x',
-        default_value='0.35',
-        description='Target X position in meters (robot_base_link frame)'
-    )
-    target_y_arg = DeclareLaunchArgument(
-        'target_y',
-        default_value='0.0',
-        description='Target Y position in meters (robot_base_link frame)'
-    )
-    target_z_arg = DeclareLaunchArgument(
-        'target_z',
-        default_value='-0.10',
-        description='Target Z position in meters (robot_base_link frame)'
-    )
     duration_sec_arg = DeclareLaunchArgument(
         'duration_sec',
         default_value='2.0',
@@ -36,15 +28,25 @@ def generate_launch_description() -> LaunchDescription:
         default_value='500000',
         description='Duration for laser activation in microseconds'
     )
-    auto_start_arg = DeclareLaunchArgument(
-        'auto_start',
-        default_value='false',
-        description='Whether to automatically trigger weed removal on node start'
-    )
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time',
         default_value='true',
         description='Use simulation clock time'
+    )
+    approx_weed_topic_arg = DeclareLaunchArgument(
+        'approx_weed_topic',
+        default_value='/tracked_weeds',
+        description='Topic publishing 3D weed coordinates from first camera / YOLO pipeline'
+    )
+    robot_stopped_topic_arg = DeclareLaunchArgument(
+        'robot_stopped_topic',
+        default_value='/robot_stopped',
+        description='Topic publishing robot stop status (Bool) to gate weeding'
+    )
+    auto_start_weeding_arg = DeclareLaunchArgument(
+        'auto_start_weeding',
+        default_value='false',
+        description='If true, treat robot as stopped and begin weeding immediately upon detection'
     )
 
     state_machine_node = Node(
@@ -53,25 +55,24 @@ def generate_launch_description() -> LaunchDescription:
         name='state_machine_node',
         output='screen',
         parameters=[{
-            'target_x': LaunchConfiguration('target_x'),
-            'target_y': LaunchConfiguration('target_y'),
-            'target_z': LaunchConfiguration('target_z'),
             'duration_sec': LaunchConfiguration('duration_sec'),
             'laser_duration_us': LaunchConfiguration('laser_duration_us'),
-            'auto_start': LaunchConfiguration('auto_start'),
             'use_sim_time': LaunchConfiguration('use_sim_time'),
+            'approx_weed_topic': LaunchConfiguration('approx_weed_topic'),
+            'robot_stopped_topic': LaunchConfiguration('robot_stopped_topic'),
+            'auto_start_weeding': LaunchConfiguration('auto_start_weeding'),
         }]
     )
 
     return LaunchDescription([
+        domain_id_arg,
         set_rmw,
         set_domain_id,
-        target_x_arg,
-        target_y_arg,
-        target_z_arg,
         duration_sec_arg,
         laser_duration_us_arg,
-        auto_start_arg,
         use_sim_time_arg,
+        approx_weed_topic_arg,
+        robot_stopped_topic_arg,
+        auto_start_weeding_arg,
         state_machine_node,
     ])

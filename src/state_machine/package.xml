@@ -13,6 +13,7 @@
   <depend>builtin_interfaces</depend>
   <depend>jaetrobi_controller_msgs</depend>
   <depend>laser_control_interfaces</depend>
+  <depend>custom_msgs</depend>
   <depend>moveit_msgs</depend>
   <depend>controller_manager_msgs</depend>
 

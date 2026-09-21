@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Direct entry point for state_machine_node, bypassing fragile setuptools metadata."""
+
+import sys
+
+try:
+    from state_machine.state_machine_node import main
+except ImportError:
+    # If state_machine module is in parent directory
+    import os
+    pkg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'lib', 'python3.12', 'site-packages'))
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
+    from state_machine.state_machine_node import main
+
+
+if __name__ == '__main__':
+    sys.exit(main())
