@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 Franek
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Weed Queue Manager for multi-weed laser removal coordination.
 
@@ -50,7 +64,7 @@ class WeedQueueManager:
         Check if a weed ID has already been removed.
 
         :param weed_id: Unique integer identifier of the weed.
-        :return: True if the weed has already been lasered/removed, False otherwise.
+        :return: True if the weed has already been lasered/removed.
         """
         return weed_id in self._removed_ids
 
@@ -70,14 +84,14 @@ class WeedQueueManager:
         timestamp: Optional[float] = None
     ) -> bool:
         """
-        Add a newly detected weed or update position of an existing queued weed.
+        Add newly detected weed or update position of existing weed.
 
         If the weed has already been marked as removed, it is ignored.
 
         :param weed_id: Unique integer identifier of the weed.
         :param position: 3D coordinates (Point) in the robot base frame.
-        :param timestamp: Detection timestamp (defaults to current system time).
-        :return: True if a new weed was added to the queue, False if ignored or updated.
+        :param timestamp: Detection timestamp (defaults to system time).
+        :return: True if new weed added to queue, False if ignored or updated.
         """
         if self.is_removed(weed_id):
             return False
@@ -90,14 +104,18 @@ class WeedQueueManager:
             self._queue[weed_id].timestamp = ts
             return False
 
-        self._queue[weed_id] = QueuedWeed(weed_id=weed_id, position=position, timestamp=ts)
+        self._queue[weed_id] = QueuedWeed(
+            weed_id=weed_id,
+            position=position,
+            timestamp=ts,
+        )
         return True
 
     def mark_removed(self, weed_id: int) -> bool:
         """
         Mark a weed as removed.
 
-        Removes the weed from the active queue and adds its ID to the removed set,
+        Removes weed from active queue and adds ID to removed set,
         guaranteeing it will never be lasered again.
 
         :param weed_id: Unique integer identifier of the weed.
@@ -116,6 +134,24 @@ class WeedQueueManager:
         """
         return self._queue.get(weed_id)
 
+    def get_oldest_queued_weed(self) -> Optional[QueuedWeed]:
+        """
+        Return the oldest unremoved weed in the queue (FIFO order).
+
+        :return: Oldest QueuedWeed instance if not empty, None otherwise.
+        """
+        if not self._queue:
+            return None
+        return next(iter(self._queue.values()))
+
+    def get_all_active_weeds(self) -> List[QueuedWeed]:
+        """
+        Return list of all active unremoved weeds currently in queue.
+
+        :return: List of QueuedWeed instances in FIFO order.
+        """
+        return list(self._queue.values())
+
     def get_next_reachable(
         self,
         is_reachable_fn: Callable[[Point], bool]
@@ -123,8 +159,8 @@ class WeedQueueManager:
         """
         Find the next queued weed reachable by the arm workspace.
 
-        :param is_reachable_fn: Callable returning True if Point is within reachable bounds.
-        :return: The first reachable QueuedWeed (FIFO order), or None if none reachable.
+        :param is_reachable_fn: Callable returning True if Point is in bounds.
+        :return: First reachable QueuedWeed (FIFO), or None if none reachable.
         """
         for weed in self._queue.values():
             if is_reachable_fn(weed.position):
@@ -138,7 +174,7 @@ class WeedQueueManager:
         """
         Pop and return the next queued weed reachable by the arm workspace.
 
-        :param is_reachable_fn: Callable returning True if Point is within reachable bounds.
+        :param is_reachable_fn: Callable returning True if Point is in bounds.
         :return: The popped QueuedWeed, or None if none reachable.
         """
         target_id: Optional[int] = None
@@ -158,8 +194,8 @@ class WeedQueueManager:
         """
         Check if any currently queued weeds are within reachable bounds.
 
-        :param is_reachable_fn: Callable returning True if Point is within reachable bounds.
-        :return: True if at least one weed in queue is reachable, False otherwise.
+        :param is_reachable_fn: Callable returning True if Point is in bounds.
+        :return: True if at least one weed is reachable, False otherwise.
         """
         return any(is_reachable_fn(w.position) for w in self._queue.values())
 

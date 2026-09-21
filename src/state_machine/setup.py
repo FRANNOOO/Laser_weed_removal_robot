@@ -15,7 +15,10 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'),
             glob(os.path.join('launch', '*launch.[pxy][yma]*'))),
-        ('lib/' + package_name, ['scripts/state_machine_node']),
+        ('lib/' + package_name, [
+            'scripts/state_machine_node',
+            'scripts/nav_integration_node',
+        ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

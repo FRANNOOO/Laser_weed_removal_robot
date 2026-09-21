@@ -15,7 +15,9 @@
 """Unit tests for WeedQueueManager."""
 
 from geometry_msgs.msg import Point
+
 import pytest
+
 from state_machine.weed_queue_manager import WeedQueueManager
 
 
@@ -61,7 +63,7 @@ def test_mark_removed_and_prevent_duplicates(queue_mgr):
     assert queue_mgr.removed_count == 1
     assert queue_mgr.is_removed(101) is True
 
-    # Attempt to re-enqueue the same weed ID (simulate repeated YOLO detections)
+    # Attempt to re-enqueue the same weed ID (simulate repeated detections)
     assert queue_mgr.add_or_update(101, p1) is False
     assert queue_mgr.queue_size == 0
     assert queue_mgr.is_removed(101) is True
@@ -100,3 +102,32 @@ def test_get_next_reachable(queue_mgr):
     assert queue_mgr.queue_size == 1
     assert queue_mgr.has_reachable_weeds(is_in_ws) is False
     assert queue_mgr.get_next_reachable(is_in_ws) is None
+
+
+def test_get_oldest_queued_weed(queue_mgr):
+    """Test retrieving oldest queued weed in FIFO order."""
+    assert queue_mgr.get_oldest_queued_weed() is None
+    assert queue_mgr.get_all_active_weeds() == []
+
+    p1 = Point(x=0.38, y=0.01, z=-0.10)
+    p2 = Point(x=0.35, y=-0.02, z=-0.10)
+    p3 = Point(x=0.32, y=0.03, z=-0.10)
+
+    queue_mgr.add_or_update(101, p1)
+    queue_mgr.add_or_update(102, p2)
+    queue_mgr.add_or_update(103, p3)
+
+    oldest = queue_mgr.get_oldest_queued_weed()
+    assert oldest is not None
+    assert oldest.weed_id == 101
+    assert oldest.position.x == 0.38
+
+    # Mark 101 removed, oldest should become 102
+    queue_mgr.mark_removed(101)
+    oldest = queue_mgr.get_oldest_queued_weed()
+    assert oldest is not None
+    assert oldest.weed_id == 102
+
+    active = queue_mgr.get_all_active_weeds()
+    assert len(active) == 2
+    assert [w.weed_id for w in active] == [102, 103]

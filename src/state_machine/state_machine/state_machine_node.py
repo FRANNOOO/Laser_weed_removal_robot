@@ -43,7 +43,7 @@ class StateMachineNode(Node):
     """ROS 2 Node coordinating weed removal and multi-weed queue management."""
 
     def __init__(self, node_name: str = 'state_machine_node') -> None:
-        """Initialize state machine node, parameters, clients, topics, and queue."""
+        """Initialize state machine node, parameters, and queue."""
         super().__init__(node_name)
 
         # Declare parameters
@@ -65,11 +65,21 @@ class StateMachineNode(Node):
 
         # Read parameters
         self._duration_sec = float(self.get_parameter('duration_sec').value)
-        self._laser_duration_us = int(self.get_parameter('laser_duration_us').value)
-        self._approx_weed_topic = str(self.get_parameter('approx_weed_topic').value)
-        self._robot_stopped_topic = str(self.get_parameter('robot_stopped_topic').value)
-        self._auto_start_weeding = bool(self.get_parameter('auto_start_weeding').value)
-        self._target_z_default = float(self.get_parameter('target_z_default').value)
+        self._laser_duration_us = int(
+            self.get_parameter('laser_duration_us').value
+        )
+        self._approx_weed_topic = str(
+            self.get_parameter('approx_weed_topic').value
+        )
+        self._robot_stopped_topic = str(
+            self.get_parameter('robot_stopped_topic').value
+        )
+        self._auto_start_weeding = bool(
+            self.get_parameter('auto_start_weeding').value
+        )
+        self._target_z_default = float(
+            self.get_parameter('target_z_default').value
+        )
 
         ws_min = (
             float(self.get_parameter('workspace_min_x').value),
@@ -81,7 +91,9 @@ class StateMachineNode(Node):
             float(self.get_parameter('workspace_max_y').value),
             float(self.get_parameter('workspace_max_z').value),
         )
-        enforce_limits = bool(self.get_parameter('enforce_workspace_limits').value)
+        enforce_limits = bool(
+            self.get_parameter('enforce_workspace_limits').value
+        )
 
         # Action and service clients
         self.arm = CartesianActionClient(
@@ -105,20 +117,40 @@ class StateMachineNode(Node):
 
         # Publishers for diagram state & control flags
         self._state_pub = self.create_publisher(String, '~/state', 10)
-        self._ready_for_removal_pub = self.create_publisher(Bool, '~/ready_for_removal', 10)
-        self._laser_trigger_pub = self.create_publisher(Bool, '~/laser_trigger', 10)
-        self._arm_send_goal_pub = self.create_publisher(Bool, '~/arm_send_goal', 10)
-        self._trigger_yolo_pub = self.create_publisher(Bool, '~/trigger_yolo', 10)
-        self._removal_finished_pub = self.create_publisher(Bool, '~/removal_finished', 10)
+        self._ready_for_removal_pub = self.create_publisher(
+            Bool, '~/ready_for_removal', 10
+        )
+        self._laser_trigger_pub = self.create_publisher(
+            Bool, '~/laser_trigger', 10
+        )
+        self._arm_send_goal_pub = self.create_publisher(
+            Bool, '~/arm_send_goal', 10
+        )
+        self._trigger_yolo_pub = self.create_publisher(
+            Bool, '~/trigger_yolo', 10
+        )
+        self._removal_finished_pub = self.create_publisher(
+            Bool, '~/removal_finished', 10
+        )
 
         # High-level coordination publishers
-        self._weed_removed_pub = self.create_publisher(Int32, '~/weed_removed', 10)
-        self._all_weeds_treated_pub = self.create_publisher(Bool, '~/all_weeds_treated', 10)
-        self._queue_size_pub = self.create_publisher(Int32, '~/queue_size', 10)
-        self._weeding_active_pub = self.create_publisher(Bool, '~/weeding_active', 10)
+        self._weed_removed_pub = self.create_publisher(
+            Int32, '~/weed_removed', 10
+        )
+        self._all_weeds_treated_pub = self.create_publisher(
+            Bool, '~/all_weeds_treated', 10
+        )
+        self._queue_size_pub = self.create_publisher(
+            Int32, '~/queue_size', 10
+        )
+        self._weeding_active_pub = self.create_publisher(
+            Bool, '~/weeding_active', 10
+        )
 
         if CUSTOM_MSGS_AVAILABLE:
-            self._weed_burned_pub = self.create_publisher(Weed, '/weed_burned', 10)
+            self._weed_burned_pub = self.create_publisher(
+                Weed, '/weed_burned', 10
+            )
         else:
             self._weed_burned_pub = None
 
@@ -131,11 +163,11 @@ class StateMachineNode(Node):
                 10,
             )
             self.get_logger().info(
-                f'Subscribed to approx weeds topic: {self._approx_weed_topic} (WeedInfo)'
+                f'Subscribed to approx weeds topic: {self._approx_weed_topic}'
             )
         else:
             self.get_logger().warn(
-                'custom_msgs not available; subscription to /tracked_weeds disabled.'
+                'custom_msgs not available; /tracked_weeds disabled.'
             )
 
         # Subscriptions: Robot Stop Flag
@@ -146,7 +178,7 @@ class StateMachineNode(Node):
             10,
         )
         self.get_logger().info(
-            f'Subscribed to robot stopped topic: {self._robot_stopped_topic} (Bool)'
+            f'Subscribed to robot stopped topic: {self._robot_stopped_topic}'
         )
 
         # Backward-compatible manual injection subscriptions
@@ -247,10 +279,12 @@ class StateMachineNode(Node):
         """
         Check queue for next reachable weed and begin removal sequence.
 
-        :return: True if a weed removal sequence was initiated, False otherwise.
+        :return: True if a weed removal was initiated, False otherwise.
         """
         if not (self._robot_stopped or self._auto_start_weeding):
-            self.get_logger().info('Robot is moving (robot_stopped=False); waiting to stop.')
+            self.get_logger().info(
+                'Robot moving (robot_stopped=False); waiting to stop.'
+            )
             return False
 
         if self._state != State.IDLE:
@@ -260,15 +294,16 @@ class StateMachineNode(Node):
         if next_weed is None:
             if self.queue_mgr.queue_size > 0:
                 self.get_logger().info(
-                    f'{self.queue_mgr.queue_size} weed(s) in queue, but none reachable '
-                    'in current workspace.'
+                    f'{self.queue_mgr.queue_size} weed(s) in queue, '
+                    'none reachable in workspace.'
                 )
             return False
 
         self._current_weed = next_weed
         self.get_logger().info(
             f'Targeting weed ID={next_weed.weed_id} at '
-            f'({next_weed.position.x:.4f}, {next_weed.position.y:.4f}, {next_weed.position.z:.4f})'
+            f'({next_weed.position.x:.4f}, {next_weed.position.y:.4f}, '
+            f'{next_weed.position.z:.4f})'
         )
         self._enter_approx_loc(next_weed.position)
         return True
@@ -277,21 +312,26 @@ class StateMachineNode(Node):
         """
         Handle updates to the robot stopped flag.
 
-        :param msg: Boolean indicating if robot has stopped (True) or is driving (False).
+        :param msg: Boolean flag indicating if robot has stopped.
         """
         prev_stopped = self._robot_stopped
         self._robot_stopped = msg.data
-        self.get_logger().info(f'Robot stopped flag updated: {self._robot_stopped}')
+        self.get_logger().info(
+            f'Robot stopped flag updated: {self._robot_stopped}'
+        )
 
-        if self._robot_stopped and not prev_stopped and self._state == State.IDLE:
-            self.get_logger().info('Robot stopped; checking queued weeds for removal.')
+        if (self._robot_stopped and not prev_stopped and
+                self._state == State.IDLE):
+            self.get_logger().info(
+                'Robot stopped; checking queued weeds for removal.'
+            )
             self._check_and_start_next_weed()
 
     def _tracked_weeds_callback(self, msg: WeedInfo) -> None:
         """
         Handle incoming 3D weed coordinates from first camera / YOLO tracker.
 
-        :param msg: WeedInfo message containing array of detected weeds with IDs.
+        :param msg: WeedInfo message with detected weeds and IDs.
         """
         new_count = 0
         for weed in msg.weeds:
@@ -305,18 +345,24 @@ class StateMachineNode(Node):
             if abs(z) < 1e-3 or not (ws_min_z <= z <= ws_max_z):
                 z = self._target_z_default
 
-            pos = Point(x=float(weed.position_x), y=float(weed.position_y), z=float(z))
+            pos = Point(
+                x=float(weed.position_x),
+                y=float(weed.position_y),
+                z=float(z),
+            )
 
             if self.queue_mgr.add_or_update(weed.id, pos):
                 new_count += 1
 
         if new_count > 0:
             self.get_logger().info(
-                f'Enqueued {new_count} new weed(s). Total in queue: {self.queue_mgr.queue_size}'
+                f'Enqueued {new_count} new weed(s). '
+                f'Total in queue: {self.queue_mgr.queue_size}'
             )
             self._publish_queue_size()
 
-        if (self._robot_stopped or self._auto_start_weeding) and self._state == State.IDLE:
+        stopped_or_auto = self._robot_stopped or self._auto_start_weeding
+        if stopped_or_auto and self._state == State.IDLE:
             self._check_and_start_next_weed()
 
     # --- State Transitions ---
@@ -329,14 +375,15 @@ class StateMachineNode(Node):
         self._publish_flag(self._arm_send_goal_pub, False)
         self._publish_flag(self._trigger_yolo_pub, False)
         self.get_logger().info(
-            'Idle: ready_for_removal=True, laser_trigger=False, arm_send_goal=False'
+            'Idle: ready_for_removal=True, laser_trigger=False, '
+            'arm_send_goal=False'
         )
 
     def _enter_approx_loc(self, target: Point) -> None:
         """
         Enter Approx_loc state upon weed targeting.
 
-        :param target: Approximate coordinates to position the arm above the weed.
+        :param target: Approximate coordinates to position the arm.
         """
         self._approx_loc = target
         self._set_state(State.APPROX_LOC)
@@ -345,8 +392,8 @@ class StateMachineNode(Node):
         valid, reason = self.arm.check_workspace(target.x, target.y, target.z)
         if not valid:
             self.get_logger().error(
-                f'Approx target ({target.x:.3f}, {target.y:.3f}, {target.z:.3f}) '
-                f'outside workspace: {reason}'
+                f'Approx target ({target.x:.3f}, {target.y:.3f}, '
+                f'{target.z:.3f}) outside workspace: {reason}'
             )
             self._current_weed = None
             self._enter_idle()
@@ -354,8 +401,8 @@ class StateMachineNode(Node):
 
         self._publish_flag(self._arm_send_goal_pub, True)
         self.get_logger().info(
-            f'Approx_loc: arm_goal_pose=({target.x:.4f}, {target.y:.4f}, {target.z:.4f}), '
-            'arm_send_goal=True'
+            f'Approx_loc: arm_goal_pose=({target.x:.4f}, {target.y:.4f}, '
+            f'{target.z:.4f}), arm_send_goal=True'
         )
 
         def on_approx_move_done(result):
@@ -363,14 +410,16 @@ class StateMachineNode(Node):
             if result is None or result.status != 4:
                 status_code = result.status if result else 'REJECTED'
                 self.get_logger().error(
-                    f'Motion to approx_loc failed with status {status_code}. Returning to Idle.'
+                    f'Motion to approx_loc failed with status {status_code}. '
+                    'Returning to Idle.'
                 )
                 self._current_weed = None
                 self._enter_idle()
                 return
 
             self.get_logger().info(
-                'Approx_loc: [arm_move_done] -> transitioning to Detect_Precise'
+                'Approx_loc: [arm_move_done] -> '
+                'transitioning to Detect_Precise'
             )
             self._enter_detect_precise()
 
@@ -381,7 +430,9 @@ class StateMachineNode(Node):
         )
         self._publish_flag(self._arm_send_goal_pub, False)
         if not sent:
-            self.get_logger().error('Failed to send goal to approx_loc. Returning to Idle.')
+            self.get_logger().error(
+                'Failed to send goal to approx_loc. Returning to Idle.'
+            )
             self._current_weed = None
             self._enter_idle()
 
@@ -389,7 +440,9 @@ class StateMachineNode(Node):
         """Enter Detect_Precise state upon arm arrival at approx position."""
         self._set_state(State.DETECT_PRECISE)
         self._publish_flag(self._trigger_yolo_pub, True)
-        self.get_logger().info('Detect_Precise: trigger_yolo=True (awaiting [yolo_done])')
+        self.get_logger().info(
+            'Detect_Precise: trigger_yolo=True (awaiting [yolo_done])'
+        )
         self._publish_flag(self._trigger_yolo_pub, False)
 
     def _enter_move_to_precise(self, target: Point) -> None:
@@ -404,8 +457,8 @@ class StateMachineNode(Node):
         valid, reason = self.arm.check_workspace(target.x, target.y, target.z)
         if not valid:
             self.get_logger().error(
-                f'Precise target ({target.x:.3f}, {target.y:.3f}, {target.z:.3f}) '
-                f'outside workspace: {reason}'
+                f'Precise target ({target.x:.3f}, {target.y:.3f}, '
+                f'{target.z:.3f}) outside workspace: {reason}'
             )
             self._current_weed = None
             self._enter_idle()
@@ -413,8 +466,8 @@ class StateMachineNode(Node):
 
         self._publish_flag(self._arm_send_goal_pub, True)
         self.get_logger().info(
-            f'Move_to_precise: arm_goal_pose=({target.x:.4f}, {target.y:.4f}, {target.z:.4f}), '
-            'arm_send_goal=True'
+            f'Move_to_precise: arm_goal_pose=({target.x:.4f}, '
+            f'{target.y:.4f}, {target.z:.4f}), arm_send_goal=True'
         )
 
         def on_precise_move_done(result):
@@ -422,13 +475,16 @@ class StateMachineNode(Node):
             if result is None or result.status != 4:
                 status_code = result.status if result else 'REJECTED'
                 self.get_logger().error(
-                    f'Motion to precise_loc failed with status {status_code}. Returning to Idle.'
+                    f'Motion to precise_loc failed with status {status_code}. '
+                    'Returning to Idle.'
                 )
                 self._current_weed = None
                 self._enter_idle()
                 return
 
-            self.get_logger().info('Move_to_precise: [arm_move_done] -> transitioning to Lasering')
+            self.get_logger().info(
+                'Move_to_precise: [arm_move_done] -> transitioning to Lasering'
+            )
             self._enter_lasering()
 
         sent = self.arm.move_to_position(
@@ -438,7 +494,9 @@ class StateMachineNode(Node):
         )
         self._publish_flag(self._arm_send_goal_pub, False)
         if not sent:
-            self.get_logger().error('Failed to send goal to precise_loc. Returning to Idle.')
+            self.get_logger().error(
+                'Failed to send goal to precise_loc. Returning to Idle.'
+            )
             self._current_weed = None
             self._enter_idle()
 
@@ -447,12 +505,15 @@ class StateMachineNode(Node):
         self._set_state(State.LASERING)
         self._publish_flag(self._laser_trigger_pub, True)
         self.get_logger().info(
-            f'Lasering: laser_trigger=True, firing for {self._laser_duration_us} us...'
+            f'Lasering: laser_trigger=True, '
+            f'firing for {self._laser_duration_us} us...'
         )
 
         future = self.laser.trigger_laser(self._laser_duration_us)
         if future is None:
-            self.get_logger().error('Laser service unavailable. Returning to Idle.')
+            self.get_logger().error(
+                'Laser service unavailable. Returning to Idle.'
+            )
             self._exit_lasering(laser_success=False)
             return
 
@@ -462,7 +523,9 @@ class StateMachineNode(Node):
                 response = res_future.result()
                 if response and response.success:
                     laser_success = True
-                    self.get_logger().info(f'Lasering succeeded: {response.message}')
+                    self.get_logger().info(
+                        f'Lasering succeeded: {response.message}'
+                    )
                 else:
                     msg = response.message if response else 'No response'
                     self.get_logger().error(f'Lasering failed: {msg}')
@@ -475,7 +538,7 @@ class StateMachineNode(Node):
 
     def _exit_lasering(self, laser_success: bool = True) -> None:
         """
-        Exit Lasering state: mark weed removed, check queue, and proceed or return to Idle.
+        Exit Lasering state and proceed with queue or Idle.
 
         :param laser_success: Whether the laser activation was successful.
         """
@@ -511,7 +574,9 @@ class StateMachineNode(Node):
 
                 self._publish_queue_size()
             else:
-                self.get_logger().warn(f'Weed ID={wid} was NOT marked removed due to laser error.')
+                self.get_logger().warn(
+                    f'Weed ID={wid} was NOT marked removed due to laser error.'
+                )
 
             self._current_weed = None
 
@@ -521,14 +586,16 @@ class StateMachineNode(Node):
 
         if can_continue and has_more:
             self.get_logger().info(
-                'More reachable weeds in queue. Continuing weeding during this stop...'
+                'More reachable weeds in queue. '
+                'Continuing weeding during this stop...'
             )
             self._enter_idle()
             self._check_and_start_next_weed()
         else:
             if can_continue and not has_more:
                 self.get_logger().info(
-                    'No more reachable weeds in queue for this stop. Weeding complete.'
+                    'No more reachable weeds in queue for this stop. '
+                    'Weeding complete.'
                 )
                 self._publish_flag(self._all_weeds_treated_pub, True)
             self._enter_idle()
@@ -552,12 +619,14 @@ class StateMachineNode(Node):
 
         self.queue_mgr.add_or_update(weed_id, pos)
         self.get_logger().info(
-            f'Manually enqueued weed ID={weed_id} at ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}). '
+            f'Manually enqueued weed ID={weed_id} at '
+            f'({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}). '
             f'Queue size: {self.queue_mgr.queue_size}'
         )
         self._publish_queue_size()
 
-        if (self._robot_stopped or self._auto_start_weeding) and self._state == State.IDLE:
+        stopped_or_auto = self._robot_stopped or self._auto_start_weeding
+        if stopped_or_auto and self._state == State.IDLE:
             self._check_and_start_next_weed()
 
     def _approx_location_pose_callback(self, msg: PoseStamped) -> None:
@@ -570,7 +639,7 @@ class StateMachineNode(Node):
 
     def _precise_location_callback(self, msg: Point) -> None:
         """
-        Handle incoming precise weed coordinates from second camera [yolo_done].
+        Handle incoming precise coordinates [yolo_done].
 
         :param msg: Precise Point coordinates.
         """
@@ -582,7 +651,7 @@ class StateMachineNode(Node):
             return
 
         self.get_logger().info(
-            f'[yolo_done]: precise_location=({msg.x:.4f}, {msg.y:.4f}, {msg.z:.4f})'
+            f'[yolo_done]: precise_loc=({msg.x:.4f}, {msg.y:.4f}, {msg.z:.4f})'
         )
         self._enter_move_to_precise(msg)
 
