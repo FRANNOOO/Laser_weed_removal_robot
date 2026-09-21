@@ -216,7 +216,7 @@ class WeedStateMachineNode(Node):
         # -- detection input --------------------------------------------------
         self._detection_sub = self.create_subscription(
             Bool,
-            'weed_detection',
+            'tracked_weeds',
             self._on_detection,
             10,
         )
