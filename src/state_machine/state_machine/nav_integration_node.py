@@ -29,14 +29,15 @@ import math
 import time
 from typing import Optional, Tuple
 
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PointStamped, Twist
 from nav_msgs.msg import Odometry
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from state_machine.weed_queue_manager import WeedQueueManager
 from std_msgs.msg import Bool, Float32, Int32, String
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
+from tf2_ros import Buffer, TransformListener
 
 try:
     from custom_msgs.msg import WeedInfo
@@ -105,6 +106,7 @@ class NavigationCoordinatorStateMachine:
     # -- IDLE -----------------------------------------------------------------
     def _enter_idle(self) -> None:
         """Enter IDLE: publish flags and arm cooldown if pending."""
+        self.node.stop_hold_position()
         self.node.publish_nav_paused(False)
         self.node.publish_robot_stopped(False)
         if self._cooldown_pending:
@@ -181,16 +183,41 @@ class NavigationCoordinatorStateMachine:
             x_str = f'{weed_x:.3f}' if weed_x is not None else 'N/A'
             self.node.get_logger().info(
                 f'Oldest weed at x={x_str}m <= trigger {trig_x:.3f}m! '
-                'Triggering Nav2 pause near back edge...'
+                'Triggering pause near back edge...'
             )
             self._transition(NavigationState.PAUSE)
         else:
             oldest = self.node.queue_mgr.get_oldest_queued_weed()
             wid = oldest.weed_id if oldest else '?'
             x_str = f'{weed_x:.3f}' if weed_x is not None else 'N/A'
-            self.node.get_logger().debug(
+            self.node.get_logger().info(
                 f'Oldest weed ID={wid} at x={x_str}m > trigger {trig_x:.3f}m. '
                 f'Queue size={self.node.queue_mgr.queue_size}. Continuing navigation.'
+            )
+
+    def on_external_pause_requested(self) -> None:
+        """Handle external pause request (e.g. from /start_stop_robot service)."""
+        if self.state == NavigationState.IDLE:
+            self.node.get_logger().info(
+                'External pause requested while in IDLE. Transitioning to PAUSE.'
+            )
+            self._transition(NavigationState.PAUSE)
+        else:
+            self.node.get_logger().info(
+                f'External pause requested while already in {self.state.value}.'
+            )
+
+    def on_external_resume_requested(self) -> None:
+        """Handle external resume request (e.g. from /start_stop_robot service)."""
+        if self.state in (NavigationState.PAUSE, NavigationState.TASK_EXE):
+            self.node.get_logger().info(
+                f'External resume requested while in {self.state.value}. '
+                'Transitioning to RESUMING.'
+            )
+            self._transition(NavigationState.RESUMING)
+        elif self.state == NavigationState.IDLE:
+            self.node.get_logger().info(
+                'External resume requested while already in IDLE.'
             )
 
     def on_odom_update(self) -> None:
@@ -224,17 +251,19 @@ class NavigationCoordinatorStateMachine:
 
     # -- PAUSE ----------------------------------------------------------------
     def _enter_pause(self) -> None:
-        """Enter PAUSE: call Nav2 pause service."""
+        """Enter PAUSE: halt velocity and call pause services."""
+        self.node.start_hold_position()
         self.node.publish_nav_paused(True)
-        self.node.get_logger().info('Calling Nav2 pause service...')
-        self.node.call_trigger_service(self.node.pause_client, 'pause')
+        self.node.publish_zero_cmd_vel()
+        self.node.get_logger().info('Calling pause services...')
+        self.node.call_pause_services()
 
     def on_pause_confirmed(self) -> None:
         """Handle successful Nav2 pause confirmation."""
         if self.state != NavigationState.PAUSE:
             return
         self.node.get_logger().info(
-            'Nav2 pause confirmed. Robot stationary; transitioning to TASK_EXE.'
+            'Pause confirmed. Robot stationary; transitioning to TASK_EXE.'
         )
         self._transition(NavigationState.TASK_EXE)
 
@@ -242,12 +271,13 @@ class NavigationCoordinatorStateMachine:
         """Handle failed Nav2 pause request."""
         if self.state != NavigationState.PAUSE:
             return
-        self.node.get_logger().error(f'Nav2 pause service returned failure: {message}')
+        self.node.get_logger().error(f'Pause service returned failure: {message}')
         self._transition(NavigationState.ERROR)
 
     # -- TASK_EXE -------------------------------------------------------------
     def _enter_task_exe(self) -> None:
         """Enter TASK_EXE: signal robot_stopped to state_machine_node and start watchdog."""
+        self.node.publish_zero_cmd_vel()
         self.node.publish_robot_stopped(True)
         self.node.publish_start_lasering(True)
         self.node.get_logger().info(
@@ -275,29 +305,31 @@ class NavigationCoordinatorStateMachine:
 
     # -- RESUMING -------------------------------------------------------------
     def _enter_resuming(self) -> None:
-        """Enter RESUMING: call Nav2 resume service and mark cooldown pending."""
+        """Enter RESUMING: call resume services and mark cooldown pending."""
+        self.node.stop_hold_position()
         self.node.publish_robot_stopped(False)
         self._cooldown_pending = True
-        self.node.get_logger().info('Calling Nav2 resume service...')
-        self.node.call_trigger_service(self.node.resume_client, 'resume')
+        self.node.get_logger().info('Calling resume services...')
+        self.node.call_resume_services()
 
     def on_resume_confirmed(self) -> None:
         """Handle successful Nav2 resume confirmation."""
         if self.state != NavigationState.RESUMING:
             return
-        self.node.get_logger().info('Nav2 resume confirmed. Transitioning to IDLE.')
+        self.node.get_logger().info('Resume confirmed. Transitioning to IDLE.')
         self._transition(NavigationState.IDLE)
 
     def on_resume_failed(self, message: str) -> None:
         """Handle failed Nav2 resume request."""
         if self.state != NavigationState.RESUMING:
             return
-        self.node.get_logger().error(f'Nav2 resume service returned failure: {message}')
+        self.node.get_logger().error(f'Resume service returned failure: {message}')
         self._transition(NavigationState.ERROR)
 
     # -- ERROR ----------------------------------------------------------------
     def _enter_error(self) -> None:
         """Enter ERROR state."""
+        self.node.stop_hold_position()
         self.node.get_logger().error('Entered ERROR state. Awaiting operator recovery.')
 
     def on_recovered(self) -> None:
@@ -322,8 +354,11 @@ class NavigationCoordinatorNode(Node):
         # Declare parameters
         self.declare_parameter('pause_service_name', '/navigate_complete_coverage/pause')
         self.declare_parameter('resume_service_name', '/navigate_complete_coverage/resume')
+        self.declare_parameter('start_stop_service_name', '/start_stop_robot')
         self.declare_parameter('service_timeout_sec', 5.0)
         self.declare_parameter('approx_weed_topic', '/tracked_weeds')
+        self.declare_parameter('tracked_weeds_topic', '')
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('detection_bool_topic', '/weed_detection')
         self.declare_parameter('robot_stopped_topic', '/robot_stopped')
         self.declare_parameter('weeds_treated_topic', '/state_machine_node/all_weeds_treated')
@@ -335,21 +370,33 @@ class NavigationCoordinatorNode(Node):
         self.declare_parameter('back_edge_margin_x', 0.020)
         self.declare_parameter('stop_delay_sec', 0.20)
         self.declare_parameter('use_velocity_lookahead', True)
-        self.declare_parameter('min_resume_distance_m', 0.80)
+        self.declare_parameter('min_resume_distance_m', 0.30)
         self.declare_parameter('task_timeout_sec', 60.0)
         self.declare_parameter('mock_nav2', False)
+        self.declare_parameter('provide_start_stop_service', True)
+        self.declare_parameter('robot_base_frame', 'robot_base_link')
+        self.declare_parameter('hold_position_on_pause', True)
 
         # Read parameters
         self.pause_service_name = str(self.get_parameter('pause_service_name').value)
         self.resume_service_name = str(self.get_parameter('resume_service_name').value)
+        self.start_stop_service_name = str(
+            self.get_parameter('start_stop_service_name').value
+        )
         self.service_timeout_sec = float(self.get_parameter('service_timeout_sec').value)
-        self.approx_weed_topic = str(self.get_parameter('approx_weed_topic').value)
+        tracked_topic = str(self.get_parameter('tracked_weeds_topic').value)
+        if tracked_topic:
+            self.approx_weed_topic = tracked_topic
+        else:
+            self.approx_weed_topic = str(self.get_parameter('approx_weed_topic').value)
+
         self.detection_bool_topic = str(self.get_parameter('detection_bool_topic').value)
         self.robot_stopped_topic = str(self.get_parameter('robot_stopped_topic').value)
         self.weeds_treated_topic = str(self.get_parameter('weeds_treated_topic').value)
         self.task_done_topic = str(self.get_parameter('task_done_topic').value)
         self.weed_removed_topic = str(self.get_parameter('weed_removed_topic').value)
         self.odom_topic = str(self.get_parameter('odom_topic').value)
+        self.cmd_vel_topic = str(self.get_parameter('cmd_vel_topic').value)
         self.workspace_min_x = float(self.get_parameter('workspace_min_x').value)
         self.workspace_max_x = float(self.get_parameter('workspace_max_x').value)
         self.back_edge_margin_x = float(self.get_parameter('back_edge_margin_x').value)
@@ -358,6 +405,13 @@ class NavigationCoordinatorNode(Node):
         self.min_resume_distance_m = float(self.get_parameter('min_resume_distance_m').value)
         self.task_timeout_sec = float(self.get_parameter('task_timeout_sec').value)
         self.mock_nav2 = bool(self.get_parameter('mock_nav2').value)
+        self.provide_start_stop_service = bool(
+            self.get_parameter('provide_start_stop_service').value
+        )
+        self.robot_base_frame = str(self.get_parameter('robot_base_frame').value)
+        self.hold_position_on_pause = bool(
+            self.get_parameter('hold_position_on_pause').value
+        )
 
         # Odometry state
         self.current_position: Optional[Tuple[float, float]] = None
@@ -366,6 +420,11 @@ class NavigationCoordinatorNode(Node):
         # Local weed tracking queue
         self.queue_mgr = WeedQueueManager()
         self._watchdog_timer = None
+        self._hold_timer = None
+
+        # TF2 buffer & listener for coordinate transforms
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Publishers
         self._robot_stopped_pub = self.create_publisher(Bool, self.robot_stopped_topic, 10)
@@ -375,6 +434,7 @@ class NavigationCoordinatorNode(Node):
         self._cooldown_active_pub = self.create_publisher(Bool, '~/cooldown_active', 10)
         self._stop_trigger_x_pub = self.create_publisher(Float32, '~/stop_trigger_x', 10)
         self._oldest_weed_x_pub = self.create_publisher(Float32, '~/oldest_weed_x', 10)
+        self._cmd_vel_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
 
         # Subscriptions: Weed Detections
         if CUSTOM_MSGS_AVAILABLE:
@@ -422,9 +482,25 @@ class NavigationCoordinatorNode(Node):
             10,
         )
 
-        # Nav2 Service Clients
+        # Service Clients
         self.pause_client = self.create_client(Trigger, self.pause_service_name)
         self.resume_client = self.create_client(Trigger, self.resume_service_name)
+        self.start_stop_client = self.create_client(
+            SetBool, self.start_stop_service_name
+        )
+
+        # Optional Service Server for UI start/stop compatibility
+        if self.provide_start_stop_service:
+            self._start_stop_srv = self.create_service(
+                SetBool,
+                self.start_stop_service_name,
+                self._on_start_stop_service_request,
+            )
+            self.get_logger().info(
+                f'Hosting service {self.start_stop_service_name} (SetBool)'
+            )
+        else:
+            self._start_stop_srv = None
 
         # FSM instance
         self.sm = NavigationCoordinatorStateMachine(self)
@@ -500,29 +576,165 @@ class NavigationCoordinatorNode(Node):
         self.stop_task_watchdog()
         self.sm.on_task_timeout()
 
-    # -- Service Calls --------------------------------------------------------
-    def call_trigger_service(self, client, label: str) -> None:
-        """Call a std_srvs/Trigger service asynchronously with timeout support."""
-        if self.mock_nav2:
-            self.get_logger().info(
-                f'[MOCK] Triggering mock {label} service response (success=True)'
+    # -- Motion Control & Service Helpers -------------------------------------
+    def publish_zero_cmd_vel(self) -> None:
+        """Publish zero velocity to cmd_vel to ensure robot halts immediately."""
+        msg = Twist()
+        self._cmd_vel_pub.publish(msg)
+
+    def start_hold_position(self) -> None:
+        """Start periodic zero-velocity publishing if hold_position_on_pause is enabled."""
+        if not self.hold_position_on_pause or self._hold_timer is not None:
+            return
+        self._hold_timer = self.create_timer(0.1, self.publish_zero_cmd_vel)
+
+    def stop_hold_position(self) -> None:
+        """Stop periodic zero-velocity publishing."""
+        if self._hold_timer is not None:
+            self._hold_timer.cancel()
+            self._hold_timer = None
+
+    def _on_start_stop_service_request(
+        self,
+        request: SetBool.Request,
+        response: SetBool.Response,
+    ) -> SetBool.Response:
+        """Handle incoming request on /start_stop_robot from UI or external caller."""
+        self.get_logger().info(
+            f'Received {self.start_stop_service_name} request: data={request.data}'
+        )
+        if request.data:
+            if self.resume_client.service_is_ready():
+                req = Trigger.Request()
+                self.resume_client.call_async(req)
+            self.sm.on_external_resume_requested()
+            response.success = True
+            response.message = 'Robot navigation resume requested'
+        else:
+            self.publish_zero_cmd_vel()
+            if self.pause_client.service_is_ready():
+                req = Trigger.Request()
+                self.pause_client.call_async(req)
+            self.sm.on_external_pause_requested()
+            response.success = True
+            response.message = 'Robot navigation pause requested'
+        return response
+
+    def transform_to_base_link(
+        self,
+        point: Point,
+        source_frame: str,
+    ) -> Point:
+        """
+        Transform a 3D Point from source_frame to robot_base_frame.
+
+        Falls back to the input point if frames match or TF is unavailable.
+        """
+        if not source_frame or source_frame == self.robot_base_frame:
+            return point
+
+        try:
+            pt_stamped = PointStamped()
+            pt_stamped.header.frame_id = source_frame
+            pt_stamped.header.stamp = rclpy.time.Time().to_msg()
+            pt_stamped.point = point
+
+            transformed = self.tf_buffer.transform(
+                pt_stamped,
+                self.robot_base_frame,
+                timeout=rclpy.duration.Duration(seconds=0.2),
             )
-            if label == 'pause':
-                self.sm.on_pause_confirmed()
-            elif label == 'resume':
-                self.sm.on_resume_confirmed()
+            return transformed.point
+        except Exception as ex:
+            if 0.20 <= point.x <= 0.60:
+                self.get_logger().debug(
+                    f'TF transform from {source_frame} failed ({ex}); using raw point.'
+                )
+                return point
+            self.get_logger().warning(
+                f'Failed to transform weed from {source_frame} to '
+                f'{self.robot_base_frame}: {ex}'
+            )
+            return point
+
+    def call_pause_services(self) -> None:
+        """Invoke available pause services (Trigger and SetBool) and halt robot."""
+        self.publish_zero_cmd_vel()
+        if self.mock_nav2:
+            self.get_logger().info('[MOCK] Mocking pause service confirmation')
+            self.sm.on_pause_confirmed()
             return
 
-        if not client.service_is_ready():
-            self.get_logger().warn(
-                f'{label} service ({client.srv_name}) is not immediately available; waiting...'
+        pause_triggered = False
+
+        # Try Trigger client (/navigate_complete_coverage/pause)
+        if self.pause_client.service_is_ready():
+            pause_triggered = True
+            req = Trigger.Request()
+            future = self.pause_client.call_async(req)
+            future.add_done_callback(
+                lambda f: self._on_service_response(f, 'pause')
+            )
+        else:
+            self.get_logger().debug(
+                f'Nav2 pause service {self.pause_service_name} not immediately available.'
             )
 
-        request = Trigger.Request()
-        future = client.call_async(request)
-        future.add_done_callback(
-            lambda f, lbl=label: self._on_service_response(f, lbl)
-        )
+        # Try SetBool client (/start_stop_robot) only if not hosting it
+        if not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
+            pause_triggered = True
+            req_bool = SetBool.Request()
+            req_bool.data = False
+            future_bool = self.start_stop_client.call_async(req_bool)
+            future_bool.add_done_callback(
+                lambda f: self._on_set_bool_response(f, 'start_stop_pause')
+            )
+
+        if not pause_triggered:
+            self.get_logger().info(
+                'External navigation pause services not active; '
+                'robot velocity halted via cmd_vel and proceeding with pause.'
+            )
+            self.sm.on_pause_confirmed()
+
+    def call_resume_services(self) -> None:
+        """Invoke available resume services (Trigger and SetBool)."""
+        if self.mock_nav2:
+            self.get_logger().info('[MOCK] Mocking resume service confirmation')
+            self.sm.on_resume_confirmed()
+            return
+
+        resume_triggered = False
+
+        # Try Trigger client (/navigate_complete_coverage/resume)
+        if self.resume_client.service_is_ready():
+            resume_triggered = True
+            req = Trigger.Request()
+            future = self.resume_client.call_async(req)
+            future.add_done_callback(
+                lambda f: self._on_service_response(f, 'resume')
+            )
+        else:
+            self.get_logger().debug(
+                f'Nav2 resume service {self.resume_service_name} not immediately available.'
+            )
+
+        # Try SetBool client (/start_stop_robot) only if not hosting it
+        if not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
+            resume_triggered = True
+            req_bool = SetBool.Request()
+            req_bool.data = True
+            future_bool = self.start_stop_client.call_async(req_bool)
+            future_bool.add_done_callback(
+                lambda f: self._on_set_bool_response(f, 'start_stop_resume')
+            )
+
+        if not resume_triggered:
+            self.get_logger().info(
+                'External navigation resume services not active; '
+                'proceeding with resume confirmation.'
+            )
+            self.sm.on_resume_confirmed()
 
     def _on_service_response(self, future, label: str) -> None:
         """Handle asynchronous Trigger service response."""
@@ -551,17 +763,41 @@ class NavigationCoordinatorNode(Node):
         elif label == 'resume':
             self.sm.on_resume_confirmed()
 
+    def _on_set_bool_response(self, future, label: str) -> None:
+        """Handle SetBool service response."""
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error(f'{label} service call failed: {exc}')
+            return
+
+        if not response or not response.success:
+            err = response.message if response else 'No response'
+            self.get_logger().warn(f'{label} returned: {err}')
+            return
+
+        self.get_logger().info(f'{label} service succeeded: {response.message}')
+        if 'pause' in label:
+            self.sm.on_pause_confirmed()
+        elif 'resume' in label:
+            self.sm.on_resume_confirmed()
+
     # -- Subscriber Callbacks -------------------------------------------------
     def _on_tracked_weeds(self, msg: 'WeedInfo') -> None:
         """Handle incoming WeedInfo message and update queue coordinates."""
         now_sec = time.time()
         for weed in msg.weeds:
-            pos = Point(
+            raw_pt = Point(
                 x=float(weed.position_x),
                 y=float(weed.position_y),
                 z=float(weed.position_z),
             )
+            pos = self.transform_to_base_link(raw_pt, msg.header.frame_id)
             self.queue_mgr.add_or_update(weed.id, pos, timestamp=now_sec)
+            self.get_logger().info(
+                f'Enqueued weed ID={weed.id} at base_link ({pos.x:.3f}, {pos.y:.3f}). '
+                f'Total in queue: {self.queue_mgr.queue_size}'
+            )
 
         self.sm.on_weed_detected()
 
@@ -600,8 +836,10 @@ def main(args=None) -> None:
     """Entry point for nav_integration_node."""
     rclpy.init(args=args)
     node = NavigationCoordinatorNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except Exception as e:
@@ -609,6 +847,7 @@ def main(args=None) -> None:
             raise
     finally:
         try:
+            executor.shutdown()
             node.destroy_node()
         except Exception:
             pass

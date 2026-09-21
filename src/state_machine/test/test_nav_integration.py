@@ -124,8 +124,28 @@ class MockCoordinatorNode:
         """Record published start_lasering boolean."""
         self.published_start_lasering.append(start)
 
+    def publish_zero_cmd_vel(self) -> None:
+        """Simulate zero velocity command."""
+        pass
+
     def call_trigger_service(self, client, name: str) -> None:
         """Simulate service call recording."""
+        pass
+
+    def call_pause_services(self) -> None:
+        """Simulate pause service call."""
+        pass
+
+    def call_resume_services(self) -> None:
+        """Simulate resume service call."""
+        pass
+
+    def start_hold_position(self) -> None:
+        """Simulate starting hold position."""
+        pass
+
+    def stop_hold_position(self) -> None:
+        """Simulate stopping hold position."""
         pass
 
     def start_task_watchdog(self) -> None:

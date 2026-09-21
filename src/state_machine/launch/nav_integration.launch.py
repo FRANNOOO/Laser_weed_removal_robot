@@ -83,4 +83,3 @@ def generate_launch_description() -> LaunchDescription:
         min_resume_distance_arg,
         nav_integration_node,
     ])
-

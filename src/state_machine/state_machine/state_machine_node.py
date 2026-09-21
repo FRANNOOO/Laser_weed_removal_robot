@@ -13,14 +13,15 @@ iterating through all reachable weeds during a single stop.
 from enum import Enum
 from typing import Optional
 
-from geometry_msgs.msg import Point, PoseStamped
+from geometry_msgs.msg import Point, PointStamped, PoseStamped
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from state_machine.action_client_arm_control import CartesianActionClient
 from state_machine.action_client_laser import ActionClientLaser
 from state_machine.weed_queue_manager import QueuedWeed, WeedQueueManager
 from std_msgs.msg import Bool, Int32, String
+from tf2_ros import Buffer, TransformListener
 
 try:
     from custom_msgs.msg import Weed, WeedInfo
@@ -62,6 +63,10 @@ class StateMachineNode(Node):
         self.declare_parameter('robot_stopped_topic', '/robot_stopped')
         self.declare_parameter('auto_start_weeding', False)
         self.declare_parameter('target_z_default', -0.100)
+        self.declare_parameter('simulate_precise_camera', True)
+        self.declare_parameter('precise_offset_x', 0.003)
+        self.declare_parameter('precise_offset_y', -0.002)
+        self.declare_parameter('robot_base_frame', 'robot_base_link')
 
         # Read parameters
         self._duration_sec = float(self.get_parameter('duration_sec').value)
@@ -79,6 +84,18 @@ class StateMachineNode(Node):
         )
         self._target_z_default = float(
             self.get_parameter('target_z_default').value
+        )
+        self._simulate_precise_camera = bool(
+            self.get_parameter('simulate_precise_camera').value
+        )
+        self._precise_offset_x = float(
+            self.get_parameter('precise_offset_x').value
+        )
+        self._precise_offset_y = float(
+            self.get_parameter('precise_offset_y').value
+        )
+        self._robot_base_frame = str(
+            self.get_parameter('robot_base_frame').value
         )
 
         ws_min = (
@@ -114,6 +131,11 @@ class StateMachineNode(Node):
         self._state = State.IDLE
         self._approx_loc: Optional[Point] = None
         self._precise_loc: Optional[Point] = None
+        self._precise_sim_timer = None
+
+        # TF2 listener for frame transformations
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Publishers for diagram state & control flags
         self._state_pub = self.create_publisher(String, '~/state', 10)
@@ -131,6 +153,9 @@ class StateMachineNode(Node):
         )
         self._removal_finished_pub = self.create_publisher(
             Bool, '~/removal_finished', 10
+        )
+        self._precise_loc_pub = self.create_publisher(
+            Point, '~/precise_location', 10
         )
 
         # High-level coordination publishers
@@ -327,6 +352,44 @@ class StateMachineNode(Node):
             )
             self._check_and_start_next_weed()
 
+    def _transform_to_base_link(
+        self,
+        point: Point,
+        source_frame: str,
+    ) -> Point:
+        """
+        Transform a 3D Point from source_frame to robot_base_frame.
+
+        Falls back to the input point if frames match or TF is unavailable.
+        """
+        if not source_frame or source_frame == self._robot_base_frame:
+            return point
+
+        try:
+            pt_stamped = PointStamped()
+            pt_stamped.header.frame_id = source_frame
+            pt_stamped.header.stamp = rclpy.time.Time().to_msg()
+            pt_stamped.point = point
+
+            transformed = self.tf_buffer.transform(
+                pt_stamped,
+                self._robot_base_frame,
+                timeout=rclpy.duration.Duration(seconds=0.2),
+            )
+            return transformed.point
+        except Exception as ex:
+            if 0.20 <= point.x <= 0.60:
+                self.get_logger().debug(
+                    f'TF transform from {source_frame} to {self._robot_base_frame} '
+                    f'failed ({ex}); using raw point within workspace.'
+                )
+                return point
+            self.get_logger().warning(
+                f'Failed to transform weed from {source_frame} to '
+                f'{self._robot_base_frame}: {ex}'
+            )
+            return point
+
     def _tracked_weeds_callback(self, msg: WeedInfo) -> None:
         """
         Handle incoming 3D weed coordinates from first camera / YOLO tracker.
@@ -345,11 +408,12 @@ class StateMachineNode(Node):
             if abs(z) < 1e-3 or not (ws_min_z <= z <= ws_max_z):
                 z = self._target_z_default
 
-            pos = Point(
+            raw_pt = Point(
                 x=float(weed.position_x),
                 y=float(weed.position_y),
                 z=float(z),
             )
+            pos = self._transform_to_base_link(raw_pt, msg.header.frame_id)
 
             if self.queue_mgr.add_or_update(weed.id, pos):
                 new_count += 1
@@ -369,6 +433,10 @@ class StateMachineNode(Node):
 
     def _enter_idle(self) -> None:
         """Enter Idle state and set diagram signals."""
+        if self._precise_sim_timer is not None:
+            self._precise_sim_timer.cancel()
+            self._precise_sim_timer = None
+
         self._set_state(State.IDLE)
         self._publish_flag(self._ready_for_removal_pub, True)
         self._publish_flag(self._laser_trigger_pub, False)
@@ -444,6 +512,50 @@ class StateMachineNode(Node):
             'Detect_Precise: trigger_yolo=True (awaiting [yolo_done])'
         )
         self._publish_flag(self._trigger_yolo_pub, False)
+
+        if self._precise_sim_timer is not None:
+            self._precise_sim_timer.cancel()
+            self._precise_sim_timer = None
+
+        if self._simulate_precise_camera:
+            self.get_logger().info(
+                'Detect_Precise: simulate_precise_camera=True; '
+                'scheduling dummy Camera 2 detection in 0.5s...'
+            )
+            self._precise_sim_timer = self.create_timer(
+                0.5, self._on_simulated_precise_detection
+            )
+
+    def _on_simulated_precise_detection(self) -> None:
+        """Synthesize precise weed detection with spatial offset."""
+        if self._precise_sim_timer is not None:
+            self._precise_sim_timer.cancel()
+            self._precise_sim_timer = None
+
+        if self._state != State.DETECT_PRECISE or self._approx_loc is None:
+            return
+
+        # Compute precise coordinates with slight offset from approx location
+        precise_x = self._approx_loc.x + self._precise_offset_x
+        precise_y = self._approx_loc.y + self._precise_offset_y
+        precise_z = self._approx_loc.z
+
+        # Clamp to arm physical workspace limits
+        ws_min = self.arm.workspace_min
+        ws_max = self.arm.workspace_max
+        precise_x = min(max(precise_x, ws_min[0]), ws_max[0])
+        precise_y = min(max(precise_y, ws_min[1]), ws_max[1])
+        precise_z = min(max(precise_z, ws_min[2]), ws_max[2])
+
+        precise_pt = Point(x=precise_x, y=precise_y, z=precise_z)
+        self.get_logger().info(
+            f'[Simulated Camera 2] Detected precise weed location: '
+            f'({precise_x:.4f}, {precise_y:.4f}, {precise_z:.4f}) '
+            f'[offset: dx={self._precise_offset_x*1000.0:.1f}mm, '
+            f'dy={self._precise_offset_y*1000.0:.1f}mm]'
+        )
+        self._precise_loc_pub.publish(precise_pt)
+        self._enter_move_to_precise(precise_pt)
 
     def _enter_move_to_precise(self, target: Point) -> None:
         """
@@ -669,9 +781,11 @@ def main(args: Optional[list] = None) -> None:
     rclpy.init(args=args)
 
     node = StateMachineNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
 
     try:
-        rclpy.spin(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except Exception as e:
@@ -679,6 +793,7 @@ def main(args: Optional[list] = None) -> None:
             raise
 
     try:
+        executor.shutdown()
         node.destroy_node()
     except Exception:
         pass

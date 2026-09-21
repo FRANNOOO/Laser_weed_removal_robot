@@ -50,6 +50,11 @@ def generate_launch_description() -> LaunchDescription:
         default_value='false',
         description='If true, treat robot as stopped and begin weeding immediately upon detection'
     )
+    simulate_precise_camera_arg = DeclareLaunchArgument(
+        'simulate_precise_camera',
+        default_value='true',
+        description='Simulate second camera detection with slight offset in simulation'
+    )
 
     # nav_integration_node arguments
     launch_nav_integration_arg = DeclareLaunchArgument(
@@ -90,6 +95,7 @@ def generate_launch_description() -> LaunchDescription:
             'approx_weed_topic': LaunchConfiguration('approx_weed_topic'),
             'robot_stopped_topic': LaunchConfiguration('robot_stopped_topic'),
             'auto_start_weeding': LaunchConfiguration('auto_start_weeding'),
+            'simulate_precise_camera': LaunchConfiguration('simulate_precise_camera'),
         }]
     )
 
@@ -102,6 +108,7 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{
             'use_sim_time': LaunchConfiguration('use_sim_time'),
             'mock_nav2': LaunchConfiguration('mock_nav2'),
+            'approx_weed_topic': LaunchConfiguration('approx_weed_topic'),
             'tracked_weeds_topic': LaunchConfiguration('approx_weed_topic'),
             'robot_stopped_topic': LaunchConfiguration('robot_stopped_topic'),
             'workspace_min_x': LaunchConfiguration('workspace_min_x'),
@@ -120,6 +127,7 @@ def generate_launch_description() -> LaunchDescription:
         approx_weed_topic_arg,
         robot_stopped_topic_arg,
         auto_start_weeding_arg,
+        simulate_precise_camera_arg,
         launch_nav_integration_arg,
         mock_nav2_arg,
         workspace_min_x_arg,
