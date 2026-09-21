@@ -1,0 +1,11 @@
+# Goal definition
+---
+# Result definition
+string error_message
+---
+# Feedback definition
+string message
+int32 killed_weeds
+int32 missed_weeds
+int32 total_weeds
+
