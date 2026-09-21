@@ -84,9 +84,10 @@ class StateMachineNode(Node):
         self._state = State.IDLE
         self._cycle_finished = False
 
-        # Publishers
+        # State publisher
         self._state_pub = self.create_publisher(String, '~/state', 10)
-        # NEW: Publisher for the final removal status
+        
+        # NEW: Publisher for the final weed removal status
         self._status_pub = self.create_publisher(String, '~/weed_removal_status', 10)
 
         # Subscriptions
@@ -188,6 +189,13 @@ class StateMachineNode(Node):
     ) -> bool:
         """
         Execute coordinated weed removal: arm motion -> laser trigger.
+
+        :param x: Target X position in meters.
+        :param y: Target Y position in meters.
+        :param z: Target Z position in meters.
+        :param duration_sec: Time for arm movement in seconds.
+        :param laser_duration_us: Duration of laser firing in microseconds.
+        :return: True if goal execution started, False if busy or validation failed.
         """
         if self._state not in (State.IDLE, State.ERROR):
             self.get_logger().warn(
@@ -249,7 +257,7 @@ class StateMachineNode(Node):
                 if response and response.success:
                     self.get_logger().info(f'Laser firing succeeded: {response.message}')
                     
-                    # NEW: Publish the message that weed has been removed
+                    # NEW: Publish the completion message
                     status_msg = String()
                     status_msg.data = "TASK_COMPLETED: Weed removed successfully."
                     self._status_pub.publish(status_msg)
@@ -258,7 +266,7 @@ class StateMachineNode(Node):
                     msg_text = response.message if response else 'No response'
                     self.get_logger().error(f'Laser firing failed: {msg_text}')
                     
-                    # NEW Publush the error of laser on the topic
+                    # NEW: Publish the laser error to the topic
                     error_msg = String()
                     error_msg.data = f"TASK_FAILED: Laser error - {msg_text}"
                     self._status_pub.publish(error_msg)
@@ -283,6 +291,13 @@ class StateMachineNode(Node):
     ) -> bool:
         """
         Execute one weed removal cycle synchronously, spinning until complete.
+
+        :param x: Target X position in meters.
+        :param y: Target Y position in meters.
+        :param z: Target Z position in meters.
+        :param laser_duration_us: Duration of laser in microseconds.
+        :param duration_sec: Arm movement duration in seconds.
+        :return: True if completed without ERROR state.
         """
         success = self.execute_weed_removal(
             x, y, z, duration_sec=duration_sec, laser_duration_us=laser_duration_us
