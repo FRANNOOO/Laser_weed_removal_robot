@@ -10,8 +10,20 @@ the necessary controllers are active.
 from typing import Callable, Optional, Tuple
 
 from builtin_interfaces.msg import Duration as MsgDuration
-from jaetrobi_controller_msgs.action import FollowCartesianTrajectory
-from moveit_msgs.msg import CartesianTrajectory, CartesianTrajectoryPoint
+try:
+    from jaetrobi_controller_msgs.action import FollowCartesianTrajectory
+    HAS_JAETROBI_MSGS = True
+except ImportError:
+    HAS_JAETROBI_MSGS = False
+    FollowCartesianTrajectory = None
+
+try:
+    from moveit_msgs.msg import CartesianTrajectory, CartesianTrajectoryPoint
+    HAS_MOVEIT_MSGS = True
+except ImportError:
+    HAS_MOVEIT_MSGS = False
+    CartesianTrajectory = None
+    CartesianTrajectoryPoint = None
 from rclpy.action import ActionClient
 from rclpy.action.client import ClientGoalHandle
 from rclpy.node import Node
@@ -54,11 +66,17 @@ class CartesianActionClient:
         self._goal_handle: Optional[ClientGoalHandle] = None
         self._is_moving: bool = False
 
-        self._client = ActionClient(
-            node,
-            FollowCartesianTrajectory,
-            action_name,
-        )
+        if HAS_JAETROBI_MSGS and FollowCartesianTrajectory is not None:
+            self._client: Optional[ActionClient] = ActionClient(
+                node,
+                FollowCartesianTrajectory,
+                action_name,
+            )
+        else:
+            self._client = None
+            self._logger.warn(
+                f'Action {action_name} msg interface not available; client in mock/offline mode.'
+            )
 
         if HAS_CONTROLLER_MANAGER:
             self._list_controllers_client = node.create_client(
@@ -90,6 +108,8 @@ class CartesianActionClient:
 
     def wait_for_server(self, timeout_sec: float = 5.0) -> bool:
         """Wait for the action server to become available."""
+        if self._client is None:
+            return False
         return self._client.wait_for_server(timeout_sec=timeout_sec)
 
     def check_workspace(self, x: float, y: float, z: float) -> Tuple[bool, str]:
@@ -126,8 +146,10 @@ class CartesianActionClient:
 
     def create_cartesian_trajectory(
         self, x: float, y: float, z: float, duration_sec: float
-    ) -> CartesianTrajectory:
+    ) -> Optional[CartesianTrajectory]:
         """Construct a valid MoveIt CartesianTrajectory message for the given target."""
+        if not HAS_MOVEIT_MSGS or CartesianTrajectory is None or CartesianTrajectoryPoint is None:
+            return None
         trajectory = CartesianTrajectory()
         trajectory.header.stamp = self._node.get_clock().now().to_msg()
         trajectory.header.frame_id = self.BASE_FRAME
@@ -257,6 +279,10 @@ class CartesianActionClient:
             return False
 
         trajectory = self.create_cartesian_trajectory(x, y, z, duration_sec)
+        if trajectory is None or FollowCartesianTrajectory is None:
+            self._logger.error('Cannot construct FollowCartesianTrajectory goal.')
+            return False
+
         goal_msg = FollowCartesianTrajectory.Goal()
         goal_msg.trajectory = trajectory
 

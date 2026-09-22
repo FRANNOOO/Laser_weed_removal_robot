@@ -65,6 +65,8 @@ class MockCoordinatorNode:
         # Geometry and thresholds
         self.workspace_min_x = 0.290
         self.workspace_max_x = 0.400
+        self.workspace_min_y = -0.070
+        self.workspace_max_y = 0.070
         self.back_edge_margin_x = 0.040
         self.use_velocity_lookahead = True
         self.stop_delay_sec = 0.80
@@ -339,3 +341,18 @@ def test_service_failures_lead_to_error(coordinator_sm, mock_node):
     coordinator_sm.state = NavigationState.RESUMING
     coordinator_sm.on_resume_failed('Resume rejected')
     assert coordinator_sm.state == NavigationState.ERROR
+
+
+def test_lateral_unreachable_weeds_do_not_trigger_stop(coordinator_sm, mock_node):
+    """Test that weeds outside lateral workspace bounds [min_y, max_y] do not trigger stop."""
+    # Weed at x=0.385 (near back edge), but lateral y=0.150 is outside [-0.070, 0.070]
+    mock_node.queue_mgr.add_or_update(1, Point(x=0.385, y=0.150, z=-0.10))
+    coordinator_sm.on_weed_detected()
+    # Must remain IDLE because candidate is laterally unreachable
+    assert coordinator_sm.state == NavigationState.IDLE
+
+    # Now add weed within lateral reach [-0.070, 0.070]
+    mock_node.queue_mgr.add_or_update(2, Point(x=0.385, y=0.020, z=-0.10))
+    coordinator_sm.on_weed_detected()
+    # Must transition to PAUSE
+    assert coordinator_sm.state == NavigationState.PAUSE

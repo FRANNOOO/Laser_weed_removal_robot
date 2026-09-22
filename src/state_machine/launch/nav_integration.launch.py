@@ -10,27 +10,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description() -> LaunchDescription:
     """Generate launch description for nav_integration_node."""
-    domain_id_arg = DeclareLaunchArgument(
-        'domain_id',
-        default_value=os.environ.get('ROS_DOMAIN_ID', '1'),
-        description='ROS domain ID (1 for simulation, 2 for robot)'
-    )
-    zenoh_default = os.environ.get(
-        'ZENOH_CONFIG_OVERRIDE',
-        'mode="client";connect/endpoints=["tcp/10.32.28.148:7447"]'
-    )
-    zenoh_config_arg = DeclareLaunchArgument(
-        'zenoh_config',
-        default_value=zenoh_default,
-        description='Zenoh router configuration override'
-    )
-    set_rmw = SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_zenoh_cpp')
-    set_domain_id = SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id'))
-    set_discovery = SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET')
-    set_zenoh = SetEnvironmentVariable(
-        'ZENOH_CONFIG_OVERRIDE', LaunchConfiguration('zenoh_config')
-    )
-
+    
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time',
         default_value='true',
@@ -60,6 +40,21 @@ def generate_launch_description() -> LaunchDescription:
         'workspace_max_x',
         default_value='0.400',
         description='Back edge X coordinate of arm workspace in robot_base_link (m)'
+    )
+    workspace_min_y_arg = DeclareLaunchArgument(
+        'workspace_min_y',
+        default_value='-0.070',
+        description='Left/negative Y boundary of arm workspace in robot_base_link (m)'
+    )
+    workspace_max_y_arg = DeclareLaunchArgument(
+        'workspace_max_y',
+        default_value='0.070',
+        description='Right/positive Y boundary of arm workspace in robot_base_link (m)'
+    )
+    dedup_radius_arg = DeclareLaunchArgument(
+        'dedup_radius',
+        default_value='0.03',
+        description='Spatial deduplication radius (m) for tracking weeds'
     )
     back_edge_margin_x_arg = DeclareLaunchArgument(
         'back_edge_margin_x',
@@ -99,6 +94,9 @@ def generate_launch_description() -> LaunchDescription:
             'robot_stopped_topic': LaunchConfiguration('robot_stopped_topic'),
             'workspace_min_x': LaunchConfiguration('workspace_min_x'),
             'workspace_max_x': LaunchConfiguration('workspace_max_x'),
+            'workspace_min_y': LaunchConfiguration('workspace_min_y'),
+            'workspace_max_y': LaunchConfiguration('workspace_max_y'),
+            'dedup_radius': LaunchConfiguration('dedup_radius'),
             'back_edge_margin_x': LaunchConfiguration('back_edge_margin_x'),
             'stop_delay_sec': LaunchConfiguration('stop_delay_sec'),
             'min_resume_distance_m': LaunchConfiguration('min_resume_distance_m'),
@@ -108,18 +106,15 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     return LaunchDescription([
-        domain_id_arg,
-        zenoh_config_arg,
-        set_rmw,
-        set_domain_id,
-        set_discovery,
-        set_zenoh,
         use_sim_time_arg,
         mock_nav2_arg,
         tracked_weeds_topic_arg,
         robot_stopped_topic_arg,
         workspace_min_x_arg,
         workspace_max_x_arg,
+        workspace_min_y_arg,
+        workspace_max_y_arg,
+        dedup_radius_arg,
         back_edge_margin_x_arg,
         stop_delay_sec_arg,
         min_resume_distance_arg,

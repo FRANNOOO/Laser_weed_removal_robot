@@ -178,6 +178,35 @@ def test_purge_unreachable(queue_mgr):
     assert purged == 1
     assert queue_mgr.is_queued(1) is True
     assert queue_mgr.is_queued(2) is False
+    # Purged weeds are marked removed so they cannot be resurrected
+    assert queue_mgr.is_removed(2) is True
+    assert queue_mgr.add_or_update(2, Point(x=0.45, y=0.0, z=-0.10)) is False
+    assert queue_mgr.is_queued(2) is False
+
+
+def test_update_existing_weed_anchor_with_odom(queue_mgr):
+    """Test that re-detecting a weed updates initial_position anchor for dead-reckoning."""
+    # First detection at robot_base_link x=0.20 when odom=(0.0, 0.0, 0.0)
+    queue_mgr.add_or_update(
+        10, Point(x=0.20, y=0.0, z=-0.10), odom_pose=(0.0, 0.0, 0.0)
+    )
+
+    # Robot moves forward 0.10m -> weed position advances to 0.30m
+    queue_mgr.update_positions(None, current_odom_pose=(0.10, 0.0, 0.0))
+    assert queue_mgr.get_weed(10).position.x == pytest.approx(0.30)
+
+    # New perception measurement arrives at x=0.31m when robot is at odom=(0.10, 0.0, 0.0)
+    queue_mgr.add_or_update(
+        10, Point(x=0.31, y=0.0, z=-0.10), odom_pose=(0.10, 0.0, 0.0)
+    )
+    assert queue_mgr.get_weed(10).position.x == pytest.approx(0.31)
+    assert queue_mgr.get_weed(10).initial_position.x == pytest.approx(0.31)
+
+    # Robot moves forward another 0.05m (to odom=0.15m)
+    # Displacement from new anchor is (0.15 - 0.10) = 0.05m
+    # Weed position should now be 0.31 + 0.05 = 0.36m (NOT jumping back to 0.20 + 0.15 = 0.35m)
+    queue_mgr.update_positions(None, current_odom_pose=(0.15, 0.0, 0.0))
+    assert queue_mgr.get_weed(10).position.x == pytest.approx(0.36)
 
 
 def test_get_oldest_reachable_candidate(queue_mgr):
@@ -192,3 +221,46 @@ def test_get_oldest_reachable_candidate(queue_mgr):
     candidate = queue_mgr.get_oldest_reachable_candidate(max_x_threshold=0.42)
     assert candidate is not None
     assert candidate.weed_id == 2
+
+
+def test_get_oldest_reachable_candidate_with_lateral_bounds(queue_mgr):
+    """Test retrieving oldest reachable candidate with lateral [min_y, max_y] bounds."""
+    # Weed 1 is within X threshold but outside positive lateral bound
+    queue_mgr.add_or_update(1, Point(x=0.38, y=0.12, z=-0.10))
+    # Weed 2 is within X threshold and within lateral bounds
+    queue_mgr.add_or_update(2, Point(x=0.36, y=-0.03, z=-0.10))
+    # Weed 3 is within X threshold but outside negative lateral bound
+    queue_mgr.add_or_update(3, Point(x=0.35, y=-0.15, z=-0.10))
+
+    # Without Y filtering, weed 1 would be selected
+    assert queue_mgr.get_oldest_reachable_candidate(0.40).weed_id == 1
+
+    # With Y filtering [-0.07, 0.07], weed 2 should be selected
+    cand = queue_mgr.get_oldest_reachable_candidate(
+        0.40, min_y=-0.07, max_y=0.07
+    )
+    assert cand is not None
+    assert cand.weed_id == 2
+
+
+def test_spatial_deduplication():
+    """Test spatial deduplication against nearby existing queued weeds."""
+    mgr = WeedQueueManager(dedup_radius=0.03)
+
+    # First weed detection with ID 1 at (0.35, 0.01)
+    is_new = mgr.add_or_update(1, Point(x=0.35, y=0.01, z=-0.10))
+    assert is_new is True
+    assert mgr.queue_size == 1
+
+    # Second detection with different ID 2 at (0.355, 0.015) (distance ~0.007m < 0.03m)
+    # Should update existing weed 1 and NOT create a new entry
+    is_new = mgr.add_or_update(2, Point(x=0.355, y=0.015, z=-0.10))
+    assert is_new is False
+    assert mgr.queue_size == 1
+    assert mgr.get_weed(1).position.x == pytest.approx(0.355)
+
+    # Third detection with ID 3 at (0.35, 0.08) (distance ~0.065m > 0.03m)
+    # Should create a separate queued weed
+    is_new = mgr.add_or_update(3, Point(x=0.35, y=0.08, z=-0.10))
+    assert is_new is True
+    assert mgr.queue_size == 2
