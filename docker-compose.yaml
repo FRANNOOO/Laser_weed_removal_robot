@@ -1,12 +1,13 @@
 services:
-  app_arm_control:
-    image: gitlab-extern.atb-potsdam.de:5050/am/events/260900_bootcamp_tu_berlin/app_weed_removal_state_machine
+  app_weed_removal_state_machine:
+    image: gitlab-extern.atb-potsdam.de:5050/am/events/260900_bootcamp_tu_berlin/app_weed_removal_state_machine:feat-ci-pipeline
     network_mode: host
     ipc: host
     environment:
-      ROS_DOMAIN_ID: 0
+      ROS_DOMAIN_ID: 2
       RMW_IMPLEMENTATION: rmw_zenoh_cpp
     volumes:
+      - ../config_zenoh_session.json5:/workspace/config_zenoh_session.json5
       - ./src:/workspace/src
     restart: unless-stopped
-    command: ros2 launch arm_control arm_control.launch.py
+    command: tail -f /dev/null
