@@ -1,0 +1,51 @@
+# GITLAB CI PIPELINE TO BUILD APPS
+# General concept:
+#   - Maximize caching - use local cache (one builder per project) and registry caching if runner changed or cache is pruned
+#   - Seperate build and release step: One container including source code - one container for release which is supposed to be smaller #     and does not contain source code (only python files). 
+
+variables:
+  # Name of the docker image that contains source code - the tag contains the branch name
+  DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  # Name of the docker builder instance on the runner machine - Use one builder instance per project
+  # for best use of local caching
+  DOCKER_BUILDER_NAME: builder_${CI_PROJECT_NAME}
+  # Pull all submodules
+  GIT_SUBMODULE_STRATEGY: recursive
+  # Docker build arguments that are shared across all docker build commands to reduce repeating commands
+  DOCKER_BUILD_ARGS: >
+    --push
+    --provenance=false
+    --build-arg BUILDKIT_INLINE_CACHE=1
+
+# Only run pipeline on push to branches, not for merge requests or schedules.
+# The MR are then using the source branch pipeline which is triggered by the push to the source branch.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - when: never
+
+default:
+  # The image container necessary dependencies to build the apps. For more details look at the corresponding repo
+  image: gitlab-extern.atb-potsdam.de:5050/am/ros/utils/build_container
+  # Run only on machines the the AM tag - instance runners from atb are too slow and not based on docker.
+  # That causes some issues regarding pulling of the submodules. Since we have no access to it, we cannot solve it. 
+  # We have access to the AM builder.
+  tags:
+    - AM
+
+before_script:
+  - docker login -u "$CI_REGISTRY_USER" -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
+  - docker buildx create --use --name $DOCKER_BUILDER_NAME || docker buildx use $DOCKER_BUILDER_NAME
+
+build_branch:
+  # The resource group is used to only allow on job on each branch in parallel. Otherwise the image that is pushed is not clear.
+  resource_group: docker-build-$CI_COMMIT_BRANCH
+  script: 
+    - >
+      docker buildx  build $DOCKER_BUILD_ARGS 
+      --cache-from=type=registry,ref=$DOCKER_IMAGE_NAME
+      --cache-from=type=registry,ref=${CI_REGISTRY_IMAGE}:latest 
+      --platform=linux/amd64,linux/arm64
+      --file Dockerfile
+      --tag $DOCKER_IMAGE_NAME 
+      .

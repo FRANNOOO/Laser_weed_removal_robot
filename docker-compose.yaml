@@ -1,10 +1,12 @@
 services:
   app_arm_control:
-    image: gitlab-extern.atb-potsdam.de:5050/am/ros/apps/app_template
+    image: gitlab-extern.atb-potsdam.de:5050/am/events/260900_bootcamp_tu_berlin/app_weed_removal_state_machine
     network_mode: host
     ipc: host
     environment:
       ROS_DOMAIN_ID: 0
       RMW_IMPLEMENTATION: rmw_zenoh_cpp
+    volumes:
+      - ./src:/workspace/src
     restart: unless-stopped
     command: ros2 launch arm_control arm_control.launch.py
