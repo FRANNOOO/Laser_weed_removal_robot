@@ -49,10 +49,15 @@ class WeedQueueManager:
     and queries weeds reachable within the arm's workspace.
     """
 
-    def __init__(self) -> None:
-        """Initialize empty queue and removal history."""
+    def __init__(self, dedup_radius: float = 0.0) -> None:
+        """
+        Initialize empty queue and removal history.
+
+        :param dedup_radius: Distance tolerance (m) for spatial deduplication.
+        """
         self._queue: Dict[int, QueuedWeed] = {}
         self._removed_ids: Set[int] = set()
+        self._dedup_radius = dedup_radius
 
     @property
     def queue_size(self) -> int:
@@ -116,10 +121,9 @@ class WeedQueueManager:
             # Update existing weed position and timestamp
             self._queue[weed_id].position = position
             self._queue[weed_id].timestamp = ts
-            if self._queue[weed_id].initial_position is None:
-                self._queue[weed_id].initial_position = Point(
-                    x=position.x, y=position.y, z=position.z
-                )
+            self._queue[weed_id].initial_position = Point(
+                x=position.x, y=position.y, z=position.z
+            )
             if raw_position is not None:
                 self._queue[weed_id].raw_position = raw_position
             if raw_frame_id:
@@ -127,6 +131,27 @@ class WeedQueueManager:
             if odom_pose is not None:
                 self._queue[weed_id].odom_pose_at_detection = odom_pose
             return False
+
+        # Spatial deduplication against existing queued weeds
+        if self._dedup_radius > 0.0:
+            for existing_weed in self._queue.values():
+                dist = math.hypot(
+                    position.x - existing_weed.position.x,
+                    position.y - existing_weed.position.y,
+                )
+                if dist <= self._dedup_radius:
+                    existing_weed.position = position
+                    existing_weed.timestamp = ts
+                    existing_weed.initial_position = Point(
+                        x=position.x, y=position.y, z=position.z
+                    )
+                    if raw_position is not None:
+                        existing_weed.raw_position = raw_position
+                    if raw_frame_id:
+                        existing_weed.raw_frame_id = raw_frame_id
+                    if odom_pose is not None:
+                        existing_weed.odom_pose_at_detection = odom_pose
+                    return False
 
         self._queue[weed_id] = QueuedWeed(
             weed_id=weed_id,
@@ -174,16 +199,26 @@ class WeedQueueManager:
 
     def get_oldest_reachable_candidate(
         self,
-        max_x_threshold: float
+        max_x_threshold: float,
+        min_y: Optional[float] = None,
+        max_y: Optional[float] = None,
     ) -> Optional[QueuedWeed]:
         """
         Return the oldest queued weed that has not passed beyond max_x_threshold.
 
+        Optionally filters by lateral workspace reach [min_y, max_y].
+
         :param max_x_threshold: Maximum allowable X coordinate before weed is past workspace.
+        :param min_y: Optional minimum reachable Y coordinate.
+        :param max_y: Optional maximum allowable Y coordinate.
         :return: Oldest candidate QueuedWeed, or None if none found.
         """
         for weed in self._queue.values():
             if weed.position.x <= max_x_threshold:
+                if min_y is not None and weed.position.y < min_y:
+                    continue
+                if max_y is not None and weed.position.y > max_y:
+                    continue
                 return weed
         return None
 
@@ -260,6 +295,7 @@ class WeedQueueManager:
         ]
         for wid in to_remove:
             self._queue.pop(wid, None)
+            self._removed_ids.add(wid)
         return len(to_remove)
 
     def get_all_active_weeds(self) -> List[QueuedWeed]:

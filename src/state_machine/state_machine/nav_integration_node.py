@@ -26,7 +26,6 @@ cooldown.
 
 from enum import Enum
 import math
-import time
 from typing import Optional, Tuple
 
 from geometry_msgs.msg import Point, PointStamped, Twist
@@ -162,7 +161,11 @@ class NavigationCoordinatorStateMachine:
         self.node.publish_stop_trigger_x(trig_x)
 
         max_reachable_x = self.node.workspace_max_x
-        oldest = self.node.queue_mgr.get_oldest_reachable_candidate(max_reachable_x)
+        oldest = self.node.queue_mgr.get_oldest_reachable_candidate(
+            max_reachable_x,
+            min_y=self.node.workspace_min_y,
+            max_y=self.node.workspace_max_y,
+        )
 
         if oldest is None:
             return False, None, trig_x
@@ -192,10 +195,14 @@ class NavigationCoordinatorStateMachine:
             self._transition(NavigationState.PAUSE)
         else:
             max_reachable_x = self.node.workspace_max_x
-            oldest = self.node.queue_mgr.get_oldest_reachable_candidate(max_reachable_x)
+            oldest = self.node.queue_mgr.get_oldest_reachable_candidate(
+                max_reachable_x,
+                min_y=self.node.workspace_min_y,
+                max_y=self.node.workspace_max_y,
+            )
             wid = oldest.weed_id if oldest else '?'
             x_str = f'{weed_x:.3f}' if weed_x is not None else 'N/A'
-            self.node.get_logger().info(
+            self.node.get_logger().debug(
                 f'Oldest weed ID={wid} at x={x_str}m < trigger {trig_x:.3f}m. '
                 f'Queue size={self.node.queue_mgr.queue_size}. Continuing navigation.'
             )
@@ -248,7 +255,11 @@ class NavigationCoordinatorStateMachine:
         self.node.publish_stop_trigger_x(trig_x)
 
         max_reachable_x = self.node.workspace_max_x
-        oldest = self.node.queue_mgr.get_oldest_reachable_candidate(max_reachable_x)
+        oldest = self.node.queue_mgr.get_oldest_reachable_candidate(
+            max_reachable_x,
+            min_y=self.node.workspace_min_y,
+            max_y=self.node.workspace_max_y,
+        )
         if oldest is not None:
             self.node.publish_oldest_weed_x(oldest.position.x)
 
@@ -415,6 +426,8 @@ class NavigationCoordinatorNode(Node):
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('workspace_min_x', 0.290)
         self.declare_parameter('workspace_max_x', 0.400)
+        self.declare_parameter('workspace_min_y', -0.070)
+        self.declare_parameter('workspace_max_y', 0.070)
         self.declare_parameter('back_edge_margin_x', 0.040)
         self.declare_parameter('stop_delay_sec', 0.80)
         self.declare_parameter('use_velocity_lookahead', True)
@@ -424,6 +437,7 @@ class NavigationCoordinatorNode(Node):
         self.declare_parameter('provide_start_stop_service', False)
         self.declare_parameter('robot_base_frame', 'robot_base_link')
         self.declare_parameter('hold_position_on_pause', True)
+        self.declare_parameter('dedup_radius', 0.03)
 
         # Read parameters
         self.pause_service_name = str(self.get_parameter('pause_service_name').value)
@@ -447,6 +461,8 @@ class NavigationCoordinatorNode(Node):
         self.cmd_vel_topic = str(self.get_parameter('cmd_vel_topic').value)
         self.workspace_min_x = float(self.get_parameter('workspace_min_x').value)
         self.workspace_max_x = float(self.get_parameter('workspace_max_x').value)
+        self.workspace_min_y = float(self.get_parameter('workspace_min_y').value)
+        self.workspace_max_y = float(self.get_parameter('workspace_max_y').value)
         self.back_edge_margin_x = float(self.get_parameter('back_edge_margin_x').value)
         self.stop_delay_sec = float(self.get_parameter('stop_delay_sec').value)
         self.use_velocity_lookahead = bool(self.get_parameter('use_velocity_lookahead').value)
@@ -460,14 +476,15 @@ class NavigationCoordinatorNode(Node):
         self.hold_position_on_pause = bool(
             self.get_parameter('hold_position_on_pause').value
         )
+        self.dedup_radius = float(self.get_parameter('dedup_radius').value)
 
-        # Odometry state
+        # Runtime dynamic state
         self.current_position: Optional[Tuple[float, float]] = None
         self.current_velocity: Tuple[float, float] = (0.0, 0.0)
         self.current_yaw: float = 0.0
 
         # Local weed tracking queue
-        self.queue_mgr = WeedQueueManager()
+        self.queue_mgr = WeedQueueManager(dedup_radius=self.dedup_radius)
         self._watchdog_timer = None
         self._hold_timer = None
 
@@ -832,7 +849,14 @@ class NavigationCoordinatorNode(Node):
     # -- Subscriber Callbacks -------------------------------------------------
     def _on_tracked_weeds(self, msg: 'WeedInfo') -> None:
         """Handle incoming WeedInfo message and update queue coordinates."""
-        now_sec = time.time()
+        if msg.header.stamp.sec > 0:
+            now_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        else:
+            now_sec = self.get_clock().now().nanoseconds * 1e-9
+
+        if msg.velocity_x != 0.0 and self.current_velocity == (0.0, 0.0):
+            self.current_velocity = (float(msg.velocity_x), float(msg.velocity_y))
+
         current_odom = None
         if self.current_position is not None:
             current_odom = (
@@ -841,13 +865,15 @@ class NavigationCoordinatorNode(Node):
                 self.current_yaw,
             )
         for weed in msg.weeds:
+            if self.queue_mgr.is_removed(weed.id):
+                continue
             raw_pt = Point(
                 x=float(weed.position_x),
                 y=float(weed.position_y),
                 z=float(weed.position_z),
             )
             pos = self.transform_to_base_link(raw_pt, msg.header.frame_id)
-            self.queue_mgr.add_or_update(
+            is_new = self.queue_mgr.add_or_update(
                 weed.id,
                 pos,
                 timestamp=now_sec,
@@ -855,10 +881,11 @@ class NavigationCoordinatorNode(Node):
                 raw_frame_id=msg.header.frame_id,
                 odom_pose=current_odom,
             )
-            self.get_logger().info(
-                f'Enqueued weed ID={weed.id} at base_link ({pos.x:.3f}, {pos.y:.3f}). '
-                f'Total in queue: {self.queue_mgr.queue_size}'
-            )
+            if is_new:
+                self.get_logger().info(
+                    f'Enqueued weed ID={weed.id} at base_link ({pos.x:.3f}, {pos.y:.3f}). '
+                    f'Total in queue: {self.queue_mgr.queue_size}'
+                )
 
         self.sm.on_weed_detected()
 

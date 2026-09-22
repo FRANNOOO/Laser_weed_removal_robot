@@ -12,7 +12,6 @@ iterating through all reachable weeds during a single stop.
 
 from enum import Enum
 import math
-import time
 from typing import List, Optional, Set, Tuple
 
 from geometry_msgs.msg import Point, PointStamped, PoseStamped
@@ -24,6 +23,7 @@ from state_machine.action_client_arm_control import CartesianActionClient
 from state_machine.action_client_laser import ActionClientLaser
 from state_machine.weed_queue_manager import QueuedWeed, WeedQueueManager
 from std_msgs.msg import Bool, Int32, String
+from std_srvs.srv import SetBool
 import tf2_geometry_msgs  # noqa: F401
 from tf2_ros import Buffer, TransformListener
 
@@ -32,6 +32,8 @@ try:
     CUSTOM_MSGS_AVAILABLE = True
 except ImportError:
     CUSTOM_MSGS_AVAILABLE = False
+    Weed = None
+    WeedInfo = None
 
 
 class State(str, Enum):
@@ -72,6 +74,11 @@ class StateMachineNode(Node):
         self.declare_parameter('precise_offset_y', -0.002)
         self.declare_parameter('robot_base_frame', 'robot_base_link')
         self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('detect_timeout_sec', 3.0)
+        self.declare_parameter('arm_timeout_padding_sec', 5.0)
+        self.declare_parameter('laser_timeout_padding_sec', 3.0)
+        self.declare_parameter('dedup_radius', 0.03)
+        self.declare_parameter('weeding_enabled', True)
 
         # Read parameters
         self._duration_sec = float(self.get_parameter('duration_sec').value)
@@ -105,6 +112,21 @@ class StateMachineNode(Node):
         self._odom_topic = str(
             self.get_parameter('odom_topic').value
         )
+        self._detect_timeout_sec = float(
+            self.get_parameter('detect_timeout_sec').value
+        )
+        self._arm_timeout_padding_sec = float(
+            self.get_parameter('arm_timeout_padding_sec').value
+        )
+        self._laser_timeout_padding_sec = float(
+            self.get_parameter('laser_timeout_padding_sec').value
+        )
+        self._dedup_radius = float(
+            self.get_parameter('dedup_radius').value
+        )
+        self._weeding_enabled = bool(
+            self.get_parameter('weeding_enabled').value
+        )
 
         ws_min = (
             float(self.get_parameter('workspace_min_x').value),
@@ -130,11 +152,12 @@ class StateMachineNode(Node):
         self.laser = ActionClientLaser(self)
 
         # High-level weed queue manager
-        self.queue_mgr = WeedQueueManager()
+        self.queue_mgr = WeedQueueManager(dedup_radius=self._dedup_radius)
         self._robot_stopped = self._auto_start_weeding
         self._current_weed: Optional[QueuedWeed] = None
         self._failed_weed_ids_for_stop: Set[int] = set()
         self._mock_weed_id_counter = -1
+        self._failed_count: int = 0
 
         # Odometry state for dynamic weed queue tracking
         self._current_position: Optional[Tuple[float, float]] = None
@@ -145,6 +168,9 @@ class StateMachineNode(Node):
         self._approx_loc: Optional[Point] = None
         self._precise_loc: Optional[Point] = None
         self._precise_sim_timer = None
+        self._detect_watchdog_timer = None
+        self._arm_watchdog_timer = None
+        self._laser_watchdog_timer = None
 
         # TF2 listener for frame transformations
         self.tf_buffer = Buffer()
@@ -184,6 +210,20 @@ class StateMachineNode(Node):
         self._weeding_active_pub = self.create_publisher(
             Bool, '~/weeding_active', 10
         )
+        self._removed_count_pub = self.create_publisher(
+            Int32, '~/removed_count', 10
+        )
+        self._failed_count_pub = self.create_publisher(
+            Int32, '~/failed_count', 10
+        )
+
+        # Service to dynamically enable/disable weeding
+        self._start_stop_srv = self.create_service(
+            SetBool,
+            '/start_stop_weeding',
+            self._start_stop_weeding_callback,
+        )
+        self.get_logger().info('Hosting service /start_stop_weeding (SetBool)')
 
         if CUSTOM_MSGS_AVAILABLE:
             self._weed_burned_pub = self.create_publisher(
@@ -289,6 +329,32 @@ class StateMachineNode(Node):
             self._check_controllers_timer = None
         self.arm.check_and_activate_controllers_async()
 
+    def _start_stop_weeding_callback(
+        self, request: SetBool.Request, response: SetBool.Response
+    ) -> SetBool.Response:
+        """
+        Handle /start_stop_weeding service request to enable or disable weeding.
+
+        :param request: SetBool request containing enable/disable flag.
+        :param response: SetBool response containing result.
+        :return: Populated SetBool response.
+        """
+        self._weeding_enabled = bool(request.data)
+        response.success = True
+        response.message = f'Weeding enabled set to {self._weeding_enabled}'
+        self.get_logger().info(response.message)
+        if not self._weeding_enabled:
+            if self._state != State.IDLE:
+                self.get_logger().warn(
+                    'Weeding disabled while state machine is active; returning to Idle.'
+                )
+                self._enter_idle()
+        else:
+            stopped_or_auto = self._robot_stopped or self._auto_start_weeding
+            if stopped_or_auto and self._state == State.IDLE:
+                self._check_and_start_next_weed()
+        return response
+
     def _publish_flag(self, pub, value: bool) -> None:
         """Publish a boolean control flag."""
         msg = Bool()
@@ -345,6 +411,10 @@ class StateMachineNode(Node):
 
         :return: True if a weed removal was initiated, False otherwise.
         """
+        if not self._weeding_enabled:
+            self.get_logger().debug('Weeding is disabled via /start_stop_weeding.')
+            return False
+
         if not (self._robot_stopped or self._auto_start_weeding):
             self.get_logger().info(
                 'Robot moving (robot_stopped=False); waiting to stop.'
@@ -410,6 +480,11 @@ class StateMachineNode(Node):
         if failed_id is not None:
             self._failed_weed_ids_for_stop.add(failed_id)
         self._current_weed = None
+
+        self._failed_count += 1
+        msg_failed = Int32()
+        msg_failed.data = self._failed_count
+        self._failed_count_pub.publish(msg_failed)
 
         self._enter_idle()
 
@@ -537,13 +612,19 @@ class StateMachineNode(Node):
             self.arm.workspace_max[0] + 0.15
         )
 
-    def _tracked_weeds_callback(self, msg: WeedInfo) -> None:
+    def _tracked_weeds_callback(self, msg: 'WeedInfo') -> None:
         """
         Handle incoming 3D weed coordinates from first camera / YOLO tracker.
 
         :param msg: WeedInfo message with detected weeds and IDs.
         """
-        now_sec = time.time()
+        if msg.header.stamp.sec > 0:
+            now_sec = (
+                float(msg.header.stamp.sec)
+                + float(msg.header.stamp.nanosec) * 1e-9
+            )
+        else:
+            now_sec = self.get_clock().now().nanoseconds * 1e-9
         current_odom = None
         if self._current_position is not None:
             current_odom = (
@@ -575,20 +656,78 @@ class StateMachineNode(Node):
                 new_count += 1
 
         if len(msg.weeds) > 0:
-            self.get_logger().info(
-                f'Received {len(msg.weeds)} weed detection(s). '
-                f'New: {new_count}, Total active in queue: {self.queue_mgr.queue_size}'
-            )
-            self._publish_queue_size()
+            if new_count > 0:
+                self.get_logger().info(
+                    f'Received {len(msg.weeds)} weed detection(s). '
+                    f'New: {new_count}, Total active in queue: {self.queue_mgr.queue_size}'
+                )
+                self._publish_queue_size()
+            else:
+                self.get_logger().debug(
+                    f'Received {len(msg.weeds)} weed detection updates (none new).'
+                )
 
         stopped_or_auto = self._robot_stopped or self._auto_start_weeding
         if stopped_or_auto and self._state == State.IDLE:
             self._check_and_start_next_weed()
 
+    # --- Watchdog Timers ---
+
+    def _cancel_detect_watchdog(self) -> None:
+        """Cancel the Camera 2 detection watchdog timer if active."""
+        if self._detect_watchdog_timer is not None:
+            self._detect_watchdog_timer.cancel()
+            self._detect_watchdog_timer = None
+
+    def _cancel_arm_watchdog(self) -> None:
+        """Cancel the arm trajectory action watchdog timer if active."""
+        if self._arm_watchdog_timer is not None:
+            self._arm_watchdog_timer.cancel()
+            self._arm_watchdog_timer = None
+
+    def _cancel_laser_watchdog(self) -> None:
+        """Cancel the laser service activation watchdog timer if active."""
+        if self._laser_watchdog_timer is not None:
+            self._laser_watchdog_timer.cancel()
+            self._laser_watchdog_timer = None
+
+    def _on_detect_precise_timeout(self) -> None:
+        """Handle Camera 2 detection timeout by falling back to approx location."""
+        self._cancel_detect_watchdog()
+        if self._state != State.DETECT_PRECISE:
+            return
+        if self._approx_loc is None:
+            self._on_weed_treatment_failed('Camera 2 timeout and approx_loc is None')
+            return
+        self.get_logger().warn(
+            f'Camera 2 detection timed out after {self._detect_timeout_sec:.1f}s; '
+            'falling back to approximate coordinates for lasering.'
+        )
+        self._enter_move_to_precise(self._approx_loc)
+
+    def _on_arm_timeout(self) -> None:
+        """Handle arm motion watchdog timeout."""
+        self._cancel_arm_watchdog()
+        self._publish_flag(self._arm_send_goal_pub, False)
+        self.get_logger().error(
+            f'Arm motion action timed out in state {self._state.value}; cancelling goal.'
+        )
+        self.arm.cancel_current_goal()
+        self._on_weed_treatment_failed('Arm motion action timed out')
+
+    def _on_laser_timeout(self) -> None:
+        """Handle laser activation service watchdog timeout."""
+        self._cancel_laser_watchdog()
+        self.get_logger().error('Laser activation service timed out.')
+        self._exit_lasering(laser_success=False)
+
     # --- State Transitions ---
 
     def _enter_idle(self) -> None:
         """Enter Idle state and set diagram signals."""
+        self._cancel_detect_watchdog()
+        self._cancel_arm_watchdog()
+        self._cancel_laser_watchdog()
         if self._precise_sim_timer is not None:
             self._precise_sim_timer.cancel()
             self._precise_sim_timer = None
@@ -598,6 +737,7 @@ class StateMachineNode(Node):
         self._publish_flag(self._laser_trigger_pub, False)
         self._publish_flag(self._arm_send_goal_pub, False)
         self._publish_flag(self._trigger_yolo_pub, False)
+        self._publish_flag(self._removal_finished_pub, False)
         self.get_logger().info(
             'Idle: ready_for_removal=True, laser_trigger=False, '
             'arm_send_goal=False'
@@ -609,6 +749,10 @@ class StateMachineNode(Node):
 
         :param target: Approximate coordinates to position the arm.
         """
+        self._cancel_arm_watchdog()
+        self._cancel_detect_watchdog()
+        self._cancel_laser_watchdog()
+
         # Clamp Z to valid arm workspace range. After TF transform from
         # map, weed Z is at ground level in robot_base_link (~-0.5m) but
         # the arm operates at a fixed focal height [-0.140, -0.080].
@@ -622,6 +766,7 @@ class StateMachineNode(Node):
         self._approx_loc = target
         self._set_state(State.APPROX_LOC)
         self._publish_flag(self._ready_for_removal_pub, False)
+        self._publish_flag(self._removal_finished_pub, False)
 
         valid, reason = self.arm.check_workspace(target.x, target.y, target.z)
         if not valid:
@@ -638,6 +783,7 @@ class StateMachineNode(Node):
         )
 
         def on_approx_move_done(result):
+            self._cancel_arm_watchdog()
             self._publish_flag(self._arm_send_goal_pub, False)
             if result is None or result.status != 4:
                 status_code = result.status if result else 'REJECTED'
@@ -665,9 +811,16 @@ class StateMachineNode(Node):
         self._publish_flag(self._arm_send_goal_pub, False)
         if not sent:
             self._on_weed_treatment_failed('Failed to send goal to approx_loc')
+            return
+
+        arm_timeout = self._duration_sec + self._arm_timeout_padding_sec
+        self._arm_watchdog_timer = self.create_timer(
+            arm_timeout, self._on_arm_timeout
+        )
 
     def _enter_detect_precise(self) -> None:
         """Enter Detect_Precise state upon arm arrival at approx position."""
+        self._cancel_detect_watchdog()
         self._set_state(State.DETECT_PRECISE)
         self._publish_flag(self._trigger_yolo_pub, True)
         self.get_logger().info(
@@ -686,6 +839,14 @@ class StateMachineNode(Node):
             )
             self._precise_sim_timer = self.create_timer(
                 0.5, self._on_simulated_precise_detection
+            )
+        else:
+            self.get_logger().info(
+                f'Detect_Precise: awaiting Camera 2 detection '
+                f'(watchdog timeout: {self._detect_timeout_sec:.1f}s)...'
+            )
+            self._detect_watchdog_timer = self.create_timer(
+                self._detect_timeout_sec, self._on_detect_precise_timeout
             )
 
     def _on_simulated_precise_detection(self) -> None:
@@ -725,6 +886,9 @@ class StateMachineNode(Node):
 
         :param target: Precise coordinates aligned with laser aim.
         """
+        self._cancel_detect_watchdog()
+        self._cancel_arm_watchdog()
+
         # Clamp Z to valid arm workspace range (same rationale as
         # _enter_approx_loc).
         ws_min_z = self.arm.workspace_min[2]
@@ -752,6 +916,7 @@ class StateMachineNode(Node):
         )
 
         def on_precise_move_done(result):
+            self._cancel_arm_watchdog()
             self._publish_flag(self._arm_send_goal_pub, False)
             if result is None or result.status != 4:
                 status_code = result.status if result else 'REJECTED'
@@ -778,9 +943,17 @@ class StateMachineNode(Node):
         self._publish_flag(self._arm_send_goal_pub, False)
         if not sent:
             self._on_weed_treatment_failed('Failed to send goal to precise_loc')
+            return
+
+        arm_timeout = self._duration_sec + self._arm_timeout_padding_sec
+        self._arm_watchdog_timer = self.create_timer(
+            arm_timeout, self._on_arm_timeout
+        )
 
     def _enter_lasering(self) -> None:
         """Enter Lasering state and activate laser for specified duration."""
+        self._cancel_arm_watchdog()
+        self._cancel_laser_watchdog()
         self._set_state(State.LASERING)
         self._publish_flag(self._laser_trigger_pub, True)
         self.get_logger().info(
@@ -796,7 +969,15 @@ class StateMachineNode(Node):
             self._exit_lasering(laser_success=False)
             return
 
+        laser_timeout = (
+            (self._laser_duration_us / 1e6) + self._laser_timeout_padding_sec
+        )
+        self._laser_watchdog_timer = self.create_timer(
+            laser_timeout, self._on_laser_timeout
+        )
+
         def on_laser_done(res_future):
+            self._cancel_laser_watchdog()
             laser_success = False
             try:
                 response = res_future.result()
@@ -821,6 +1002,7 @@ class StateMachineNode(Node):
 
         :param laser_success: Whether the laser activation was successful.
         """
+        self._cancel_laser_watchdog()
         self._publish_flag(self._laser_trigger_pub, False)
         self._publish_flag(self._removal_finished_pub, True)
 
@@ -841,6 +1023,11 @@ class StateMachineNode(Node):
                 msg_id = Int32()
                 msg_id.data = wid
                 self._weed_removed_pub.publish(msg_id)
+
+                # Publish cumulative removed count
+                msg_rem = Int32()
+                msg_rem.data = self.queue_mgr.removed_count
+                self._removed_count_pub.publish(msg_rem)
 
                 # Publish /weed_burned for field recorder compatibility
                 if self._weed_burned_pub is not None:
@@ -930,6 +1117,7 @@ class StateMachineNode(Node):
             )
             return
 
+        self._cancel_detect_watchdog()
         self.get_logger().info(
             f'[yolo_done]: precise_loc=({msg.x:.4f}, {msg.y:.4f}, {msg.z:.4f})'
         )

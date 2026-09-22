@@ -157,3 +157,137 @@ def test_robot_resumed_clears_failed_weeds_for_stop(sm_node):
     sm_node._robot_stopped_callback(msg)
 
     assert len(sm_node._failed_weed_ids_for_stop) == 0
+
+
+def test_detect_precise_watchdog_timeout_fallback(sm_node):
+    """Verify Camera 2 detection timeout falls back to approx location."""
+    sm_node._simulate_precise_camera = False
+    sm_node._approx_loc = Point(x=0.350, y=0.010, z=-0.100)
+    sm_node._enter_detect_precise()
+
+    assert sm_node._state == State.DETECT_PRECISE
+    assert sm_node._detect_watchdog_timer is not None
+
+    # Simulate timeout firing
+    sm_node._on_detect_precise_timeout()
+
+    assert sm_node._state == State.MOVE_TO_PRECISE
+    assert sm_node._precise_loc.x == pytest.approx(0.350)
+    assert sm_node._precise_loc.y == pytest.approx(0.010)
+    assert sm_node._detect_watchdog_timer is None
+
+
+def test_arm_watchdog_timeout_cancels_goal_and_fails_treatment(sm_node):
+    """Verify arm motion timeout cancels goal handle and marks treatment as failed."""
+    sm_node.arm.cancel_current_goal = MagicMock()
+    sm_node._robot_stopped = True
+    weed_pt = Point(x=0.350, y=0.010, z=-0.100)
+    sm_node.queue_mgr.add_or_update(77, weed_pt)
+    sm_node._check_and_start_next_weed()
+
+    assert sm_node._state == State.APPROX_LOC
+    assert sm_node._arm_watchdog_timer is not None
+
+    # Simulate arm watchdog timeout
+    sm_node._on_arm_timeout()
+
+    sm_node.arm.cancel_current_goal.assert_called_once()
+    assert sm_node._arm_watchdog_timer is None
+    assert 77 in sm_node._failed_weed_ids_for_stop
+    assert sm_node._state == State.IDLE
+
+
+def test_laser_watchdog_timeout_exits_lasering_as_failure(sm_node):
+    """Verify laser timeout exits lasering without marking weed as removed."""
+    from rclpy.task import Future
+    pending_future = Future()
+    sm_node.laser.trigger_laser = MagicMock(return_value=pending_future)
+
+    weed_pt = Point(x=0.350, y=0.010, z=-0.100)
+    sm_node.queue_mgr.add_or_update(88, weed_pt)
+    sm_node._current_weed = sm_node.queue_mgr.get_weed(88)
+    sm_node._enter_lasering()
+
+    assert sm_node._state == State.LASERING
+    assert sm_node._laser_watchdog_timer is not None
+
+    # Simulate laser watchdog timeout
+    sm_node._on_laser_timeout()
+
+    assert sm_node._laser_watchdog_timer is None
+    assert sm_node.queue_mgr.is_removed(88) is False
+    assert 88 in sm_node._failed_weed_ids_for_stop
+    assert sm_node._state == State.IDLE
+
+
+def test_enter_idle_cancels_all_watchdogs(sm_node):
+    """Verify entering Idle cancels all watchdog timers."""
+    t_detect = MagicMock()
+    t_arm = MagicMock()
+    t_laser = MagicMock()
+    t_sim = MagicMock()
+
+    sm_node._detect_watchdog_timer = t_detect
+    sm_node._arm_watchdog_timer = t_arm
+    sm_node._laser_watchdog_timer = t_laser
+    sm_node._precise_sim_timer = t_sim
+
+    sm_node._enter_idle()
+
+    t_detect.cancel.assert_called_once()
+    t_arm.cancel.assert_called_once()
+    t_laser.cancel.assert_called_once()
+    t_sim.cancel.assert_called_once()
+    assert sm_node._detect_watchdog_timer is None
+    assert sm_node._arm_watchdog_timer is None
+    assert sm_node._laser_watchdog_timer is None
+    assert sm_node._precise_sim_timer is None
+
+
+def test_start_stop_weeding_service(sm_node):
+    """Verify /start_stop_weeding service callback toggles weeding execution."""
+    from std_srvs.srv import SetBool
+    req = SetBool.Request()
+    res = SetBool.Response()
+
+    # Disable weeding
+    req.data = False
+    out_res = sm_node._start_stop_weeding_callback(req, res)
+    assert out_res.success is True
+    assert sm_node._weeding_enabled is False
+
+    # Attempt to start weed when robot is stopped
+    sm_node._robot_stopped = True
+    sm_node.queue_mgr.add_or_update(99, Point(x=0.35, y=0.0, z=-0.10))
+    started = sm_node._check_and_start_next_weed()
+    assert started is False
+    assert sm_node._state == State.IDLE
+
+    # Enable weeding
+    req.data = True
+    out_res = sm_node._start_stop_weeding_callback(req, res)
+    assert out_res.success is True
+    assert sm_node._weeding_enabled is True
+    # Enabled callback starts next weed if stopped
+    assert sm_node._state == State.APPROX_LOC
+
+
+def test_telemetry_counters(sm_node):
+    """Verify removed_count and failed_count telemetry publishing."""
+    sm_node._removed_count_pub = MagicMock()
+    sm_node._failed_count_pub = MagicMock()
+
+    # Treatment failure publishes incremented failed_count
+    sm_node._current_weed = None
+    sm_node._on_weed_treatment_failed('Test failure')
+    assert sm_node._failed_count == 1
+    sm_node._failed_count_pub.publish.assert_called_once()
+    assert sm_node._failed_count_pub.publish.call_args[0][0].data == 1
+
+    # Successful removal publishes updated removed_count
+    sm_node.queue_mgr.add_or_update(123, Point(x=0.35, y=0.0, z=-0.10))
+    sm_node._current_weed = sm_node.queue_mgr.get_weed(123)
+    sm_node._exit_lasering(laser_success=True)
+    assert sm_node.queue_mgr.removed_count == 1
+    sm_node._removed_count_pub.publish.assert_called_once()
+    assert sm_node._removed_count_pub.publish.call_args[0][0].data == 1
