@@ -19,8 +19,10 @@ from unittest.mock import MagicMock
 from geometry_msgs.msg import Point
 
 import pytest
+import rclpy
 
 from state_machine.nav_integration_node import (
+    NavigationCoordinatorNode,
     NavigationCoordinatorStateMachine,
     NavigationState,
 )
@@ -37,19 +39,19 @@ class MockLogger:
         self.errors = []
         self.debugs = []
 
-    def info(self, msg: str) -> None:
+    def info(self, msg: str, *args, **kwargs) -> None:
         """Record info message."""
         self.infos.append(msg)
 
-    def warn(self, msg: str) -> None:
+    def warn(self, msg: str, *args, **kwargs) -> None:
         """Record warn message."""
         self.warns.append(msg)
 
-    def error(self, msg: str) -> None:
+    def error(self, msg: str, *args, **kwargs) -> None:
         """Record error message."""
         self.errors.append(msg)
 
-    def debug(self, msg: str) -> None:
+    def debug(self, msg: str, *args, **kwargs) -> None:
         """Record debug message."""
         self.debugs.append(msg)
 
@@ -91,6 +93,7 @@ class MockCoordinatorNode:
         self.published_trigger_x = []
         self.published_oldest_weed_x = []
         self.published_start_lasering = []
+        self.published_service_status = []
 
         # Watchdog mocks
         self.watchdog_started = False
@@ -128,6 +131,10 @@ class MockCoordinatorNode:
         """Record published start_lasering boolean."""
         self.published_start_lasering.append(start)
 
+    def publish_service_status(self, status: str) -> None:
+        """Record published service status string."""
+        self.published_service_status.append(status)
+
     def publish_zero_cmd_vel(self) -> None:
         """Simulate zero velocity command."""
         pass
@@ -159,6 +166,14 @@ class MockCoordinatorNode:
     def stop_task_watchdog(self) -> None:
         """Mark watchdog as stopped."""
         self.watchdog_stopped = True
+
+    def start_service_timeout(self, service_type: str) -> None:
+        """Simulate starting service timeout."""
+        pass
+
+    def cancel_service_timeout(self) -> None:
+        """Simulate cancelling service timeout."""
+        pass
 
     def create_timer(self, period: float, callback) -> MagicMock:
         """Return a mock timer (does not fire automatically in tests)."""
@@ -356,3 +371,80 @@ def test_lateral_unreachable_weeds_do_not_trigger_stop(coordinator_sm, mock_node
     coordinator_sm.on_weed_detected()
     # Must transition to PAUSE
     assert coordinator_sm.state == NavigationState.PAUSE
+
+
+@pytest.fixture(scope='module')
+def rclpy_context():
+    """Initialize and teardown rclpy context for test module."""
+    if not rclpy.ok():
+        rclpy.init()
+    yield
+    if rclpy.ok():
+        rclpy.shutdown()
+
+
+def test_service_pause_timeout_confirms_pause(rclpy_context):
+    """Test that pause service timeout automatically confirms pause and proceeds to TASK_EXE."""
+    node = NavigationCoordinatorNode()
+    try:
+        node.sm.state = NavigationState.PAUSE
+        node._on_service_timeout('pause')
+        assert node.sm.state == NavigationState.TASK_EXE
+    finally:
+        node.destroy_node()
+
+
+def test_service_resume_timeout_confirms_idle(rclpy_context):
+    """Test that resume service timeout automatically confirms resume and returns to IDLE."""
+    node = NavigationCoordinatorNode()
+    try:
+        node.sm.state = NavigationState.RESUMING
+        node._on_service_timeout('resume')
+        assert node.sm.state == NavigationState.IDLE
+    finally:
+        node.destroy_node()
+
+
+def test_service_already_in_pause_confirms_pause(rclpy_context):
+    """Test that 'already in PAUSE' message acknowledges success and proceeds to TASK_EXE."""
+    node = NavigationCoordinatorNode()
+    try:
+        node.sm.state = NavigationState.PAUSE
+        future = MagicMock()
+        response = MagicMock()
+        response.success = False
+        response.message = 'Robot is already in PAUSE state'
+        future.result.return_value = response
+        node._on_service_response(future, 'pause')
+        assert node.sm.state == NavigationState.TASK_EXE
+    finally:
+        node.destroy_node()
+
+
+def test_set_bool_already_paused_confirms_pause(rclpy_context):
+    """Test that SetBool response with 'already in state PAUSED' proceeds to TASK_EXE."""
+    node = NavigationCoordinatorNode()
+    try:
+        node.sm.state = NavigationState.PAUSE
+        future = MagicMock()
+        response = MagicMock()
+        response.success = False
+        response.message = 'Robot is already in state PAUSED'
+        future.result.return_value = response
+        node._on_set_bool_response(future, 'start_stop_pause')
+        assert node.sm.state == NavigationState.TASK_EXE
+    finally:
+        node.destroy_node()
+
+
+def test_service_exception_proceeds_with_pause(rclpy_context):
+    """Test that service call exception does not hang and proceeds to TASK_EXE."""
+    node = NavigationCoordinatorNode()
+    try:
+        node.sm.state = NavigationState.PAUSE
+        future = MagicMock()
+        future.result.side_effect = RuntimeError('DDS connection lost')
+        node._on_service_response(future, 'pause')
+        assert node.sm.state == NavigationState.TASK_EXE
+    finally:
+        node.destroy_node()

@@ -31,6 +31,7 @@ from typing import Optional, Tuple
 from geometry_msgs.msg import Point, PointStamped, Twist
 from nav_msgs.msg import Odometry
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from state_machine.weed_queue_manager import WeedQueueManager
@@ -264,6 +265,13 @@ class NavigationCoordinatorStateMachine:
             self.node.publish_oldest_weed_x(oldest.position.x)
 
         if self.state != NavigationState.IDLE:
+            if oldest is not None and oldest.position.x >= trig_x:
+                self.node.get_logger().warn(
+                    f'Oldest weed at x={oldest.position.x:.3f}m >= trigger {trig_x:.3f}m, '
+                    f'but pause is blocked because coordinator is in '
+                    f'state={self.state.value} (expected IDLE).',
+                    throttle_duration_sec=2.0,
+                )
             return
 
         if self._cooldown_active:
@@ -284,6 +292,14 @@ class NavigationCoordinatorStateMachine:
                 self.node.publish_cooldown_active(False)
                 # Check if there are already weeds in queue needing removal
                 self.on_weed_detected()
+            else:
+                if oldest is not None and oldest.position.x >= trig_x:
+                    self.node.get_logger().warn(
+                        f'Oldest weed at x={oldest.position.x:.3f}m >= trigger {trig_x:.3f}m, '
+                        f'but pause is blocked by active cooldown '
+                        f'({dist:.2f}m / {self.node.min_resume_distance_m:.2f}m traveled).',
+                        throttle_duration_sec=2.0,
+                    )
             return
 
         # Not in cooldown: check if moving has brought oldest weed to back edge
@@ -487,6 +503,10 @@ class NavigationCoordinatorNode(Node):
         self.queue_mgr = WeedQueueManager(dedup_radius=self.dedup_radius)
         self._watchdog_timer = None
         self._hold_timer = None
+        self._service_timeout_timer = None
+
+        # Dedicated ReentrantCallbackGroup for navigation service clients & servers
+        self.client_cb_group = ReentrantCallbackGroup()
 
         # TF2 buffer & listener for coordinate transforms
         self.tf_buffer = Buffer()
@@ -497,10 +517,12 @@ class NavigationCoordinatorNode(Node):
         self._start_lasering_pub = self.create_publisher(Bool, '/start_lasering', 10)
         self._state_pub = self.create_publisher(String, '~/state', 10)
         self._nav_paused_pub = self.create_publisher(Bool, '~/nav_paused', 10)
+        self._global_nav_paused_pub = self.create_publisher(Bool, '/nav_paused', 10)
         self._cooldown_active_pub = self.create_publisher(Bool, '~/cooldown_active', 10)
         self._stop_trigger_x_pub = self.create_publisher(Float32, '~/stop_trigger_x', 10)
         self._oldest_weed_x_pub = self.create_publisher(Float32, '~/oldest_weed_x', 10)
         self._cmd_vel_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+        self._service_status_pub = self.create_publisher(String, '~/service_status', 10)
 
         # Subscriptions: Weed Detections
         if CUSTOM_MSGS_AVAILABLE:
@@ -549,10 +571,14 @@ class NavigationCoordinatorNode(Node):
         )
 
         # Service Clients
-        self.pause_client = self.create_client(Trigger, self.pause_service_name)
-        self.resume_client = self.create_client(Trigger, self.resume_service_name)
+        self.pause_client = self.create_client(
+            Trigger, self.pause_service_name, callback_group=self.client_cb_group
+        )
+        self.resume_client = self.create_client(
+            Trigger, self.resume_service_name, callback_group=self.client_cb_group
+        )
         self.start_stop_client = self.create_client(
-            SetBool, self.start_stop_service_name
+            SetBool, self.start_stop_service_name, callback_group=self.client_cb_group
         )
 
         # Optional Service Server for UI start/stop compatibility
@@ -561,6 +587,7 @@ class NavigationCoordinatorNode(Node):
                 SetBool,
                 self.start_stop_service_name,
                 self._on_start_stop_service_request,
+                callback_group=self.client_cb_group,
             )
             self.get_logger().info(
                 f'Hosting service {self.start_stop_service_name} (SetBool)'
@@ -599,10 +626,11 @@ class NavigationCoordinatorNode(Node):
         self._start_lasering_pub.publish(msg)
 
     def publish_nav_paused(self, value: bool) -> None:
-        """Publish nav_paused flag."""
+        """Publish nav_paused flag to namespaced and global topics."""
         msg = Bool()
         msg.data = value
         self._nav_paused_pub.publish(msg)
+        self._global_nav_paused_pub.publish(msg)
 
     def publish_cooldown_active(self, value: bool) -> None:
         """Publish cooldown_active flag."""
@@ -621,6 +649,12 @@ class NavigationCoordinatorNode(Node):
         msg = Float32()
         msg.data = float(value)
         self._oldest_weed_x_pub.publish(msg)
+
+    def publish_service_status(self, status: str) -> None:
+        """Publish status and message of navigation service operations."""
+        msg = String()
+        msg.data = status
+        self._service_status_pub.publish(msg)
 
     # -- Watchdog timer -------------------------------------------------------
     def start_task_watchdog(self) -> None:
@@ -723,105 +757,199 @@ class NavigationCoordinatorNode(Node):
             )
             return point
 
+    def start_service_timeout(self, service_type: str) -> None:
+        """Start a watchdog timer for navigation service response."""
+        self.cancel_service_timeout()
+        self._service_timeout_timer = self.create_timer(
+            self.service_timeout_sec,
+            lambda: self._on_service_timeout(service_type),
+            callback_group=self.client_cb_group,
+        )
+
+    def cancel_service_timeout(self) -> None:
+        """Cancel the active navigation service watchdog timer."""
+        if self._service_timeout_timer is not None:
+            self._service_timeout_timer.cancel()
+            self._service_timeout_timer = None
+
+    def _on_service_timeout(self, service_type: str) -> None:
+        """Handle navigation service call timeout."""
+        self.cancel_service_timeout()
+        if service_type == 'pause':
+            if self.sm.state == NavigationState.PAUSE:
+                self.get_logger().warn(
+                    f'Pause service call timed out after {self.service_timeout_sec:.1f}s '
+                    'without response. Robot velocity is held at zero via /cmd_vel; '
+                    'proceeding with pause confirmation.'
+                )
+                self.publish_service_status('PAUSE_TIMEOUT: proceeded via cmd_vel hold')
+                self.sm.on_pause_confirmed()
+        elif service_type == 'resume':
+            if self.sm.state == NavigationState.RESUMING:
+                self.get_logger().warn(
+                    f'Resume service call timed out after {self.service_timeout_sec:.1f}s '
+                    'without response. Proceeding with navigation resume.'
+                )
+                self.publish_service_status('RESUME_TIMEOUT: proceeded with resume')
+                self.sm.on_resume_confirmed()
+
     def call_pause_services(self) -> None:
         """Invoke available pause services (Trigger and SetBool) and halt robot."""
         self.publish_zero_cmd_vel()
         if self.mock_nav2:
             self.get_logger().info('[MOCK] Mocking pause service confirmation')
+            self.publish_service_status('PAUSE_MOCK: pause service confirmed')
             self.sm.on_pause_confirmed()
             return
 
         pause_triggered = False
 
-        # Try Trigger client (/navigate_complete_coverage/pause) first
-        if self.pause_client.service_is_ready():
+        # Try SetBool client (/start_stop_robot) first if available
+        if not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
             pause_triggered = True
-            req = Trigger.Request()
-            future = self.pause_client.call_async(req)
-            future.add_done_callback(
-                lambda f: self._on_service_response(f, 'pause')
+            self.get_logger().info(
+                f'Calling {self.start_stop_service_name} (SetBool data=False)...'
             )
-        # Fall back to SetBool client (/start_stop_robot) only if direct pause is unavailable
-        elif not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
-            pause_triggered = True
             req_bool = SetBool.Request()
             req_bool.data = False
-            future_bool = self.start_stop_client.call_async(req_bool)
-            future_bool.add_done_callback(
-                lambda f: self._on_set_bool_response(f, 'start_stop_pause')
-            )
-        else:
-            self.get_logger().debug(
-                f'Nav2 pause service {self.pause_service_name} not immediately available.'
-            )
+            try:
+                future_bool = self.start_stop_client.call_async(req_bool)
+                future_bool.add_done_callback(
+                    lambda f: self._on_set_bool_response(f, 'start_stop_pause')
+                )
+            except Exception as ex:
+                self.get_logger().error(
+                    f'Failed to send {self.start_stop_service_name} request: {ex}'
+                )
 
-        if not pause_triggered:
+        # Also try Trigger client (/navigate_complete_coverage/pause) if available
+        if self.pause_client.service_is_ready():
+            pause_triggered = True
+            self.get_logger().info(
+                f'Calling {self.pause_service_name} (Trigger)...'
+            )
+            req = Trigger.Request()
+            try:
+                future = self.pause_client.call_async(req)
+                future.add_done_callback(
+                    lambda f: self._on_service_response(f, 'pause')
+                )
+            except Exception as ex:
+                self.get_logger().error(
+                    f'Failed to send {self.pause_service_name} request: {ex}'
+                )
+
+        if pause_triggered:
+            self.publish_service_status('CALLING_PAUSE: waiting for response')
+            self.start_service_timeout('pause')
+        else:
             self.get_logger().info(
                 'External navigation pause services not active; '
                 'robot velocity halted via cmd_vel and proceeding with pause.'
             )
+            self.publish_service_status('PAUSE_CMD_VEL_ONLY: proceeded via cmd_vel')
             self.sm.on_pause_confirmed()
 
     def call_resume_services(self) -> None:
         """Invoke available resume services (Trigger or SetBool)."""
         if self.mock_nav2:
             self.get_logger().info('[MOCK] Mocking resume service confirmation')
+            self.publish_service_status('RESUME_MOCK: resume service confirmed')
             self.sm.on_resume_confirmed()
             return
 
         resume_triggered = False
 
-        # Try Trigger client (/navigate_complete_coverage/resume) first
-        if self.resume_client.service_is_ready():
+        # Try SetBool client (/start_stop_robot) first if available
+        if not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
             resume_triggered = True
-            req = Trigger.Request()
-            future = self.resume_client.call_async(req)
-            future.add_done_callback(
-                lambda f: self._on_service_response(f, 'resume')
+            self.get_logger().info(
+                f'Calling {self.start_stop_service_name} (SetBool data=True)...'
             )
-        # Fall back to SetBool client (/start_stop_robot) only if direct resume is unavailable
-        elif not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
-            resume_triggered = True
             req_bool = SetBool.Request()
             req_bool.data = True
-            future_bool = self.start_stop_client.call_async(req_bool)
-            future_bool.add_done_callback(
-                lambda f: self._on_set_bool_response(f, 'start_stop_resume')
-            )
-        else:
-            self.get_logger().debug(
-                f'Nav2 resume service {self.resume_service_name} not immediately available.'
-            )
+            try:
+                future_bool = self.start_stop_client.call_async(req_bool)
+                future_bool.add_done_callback(
+                    lambda f: self._on_set_bool_response(f, 'start_stop_resume')
+                )
+            except Exception as ex:
+                self.get_logger().error(
+                    f'Failed to send {self.start_stop_service_name} request: {ex}'
+                )
 
-        if not resume_triggered:
+        # Also try Trigger client (/navigate_complete_coverage/resume) if available
+        if self.resume_client.service_is_ready():
+            resume_triggered = True
+            self.get_logger().info(
+                f'Calling {self.resume_service_name} (Trigger)...'
+            )
+            req = Trigger.Request()
+            try:
+                future = self.resume_client.call_async(req)
+                future.add_done_callback(
+                    lambda f: self._on_service_response(f, 'resume')
+                )
+            except Exception as ex:
+                self.get_logger().error(
+                    f'Failed to send {self.resume_service_name} request: {ex}'
+                )
+
+        if resume_triggered:
+            self.publish_service_status('CALLING_RESUME: waiting for response')
+            self.start_service_timeout('resume')
+        else:
             self.get_logger().info(
                 'External navigation resume services not active; '
                 'proceeding with resume confirmation.'
             )
+            self.publish_service_status('RESUME_INACTIVE: proceeded with resume')
             self.sm.on_resume_confirmed()
 
     def _on_service_response(self, future, label: str) -> None:
         """Handle asynchronous Trigger service response."""
+        self.cancel_service_timeout()
         try:
             response = future.result()
         except Exception as exc:
             self.get_logger().error(f'{label} service call failed: {exc}')
+            self.publish_service_status(f'{label.upper()}_EXCEPTION: {exc}')
             if label == 'pause':
-                self.sm.on_pause_failed(str(exc))
+                self.get_logger().warn(
+                    f'{label} service exception: {exc}. Robot is stationary via cmd_vel; '
+                    'proceeding with pause confirmation.'
+                )
+                self.sm.on_pause_confirmed()
             elif label == 'resume':
-                self.sm.on_resume_failed(str(exc))
+                self.sm.on_resume_confirmed()
             return
 
         if not response or not response.success:
             err_msg = response.message if response else 'No response received'
-            self.get_logger().error(f'{label} service returned failure: {err_msg}')
+            if err_msg and ('already' in err_msg.lower() or 'paused' in err_msg.lower()):
+                self.get_logger().info(
+                    f'{label} service acknowledged (already active): {err_msg}'
+                )
+                self.publish_service_status(f'{label.upper()}_ACKNOWLEDGED: {err_msg}')
+                if label == 'pause':
+                    self.sm.on_pause_confirmed()
+                elif label == 'resume':
+                    self.sm.on_resume_confirmed()
+                return
+
+            self.get_logger().warn(
+                f'{label} service returned non-success: {err_msg}. '
+                'Proceeding with state machine transition.'
+            )
+            self.publish_service_status(f'{label.upper()}_NON_SUCCESS: {err_msg}')
             if label == 'pause':
-                self.sm.on_pause_failed(err_msg)
+                self.sm.on_pause_confirmed()
             elif label == 'resume':
-                self.sm.on_resume_failed(err_msg)
+                self.sm.on_resume_confirmed()
             return
 
         self.get_logger().info(f'{label} service succeeded: {response.message}')
+        self.publish_service_status(f'{label.upper()}_SUCCESS: {response.message}')
         if label == 'pause':
             self.sm.on_pause_confirmed()
         elif label == 'resume':
@@ -829,18 +957,43 @@ class NavigationCoordinatorNode(Node):
 
     def _on_set_bool_response(self, future, label: str) -> None:
         """Handle SetBool service response."""
+        self.cancel_service_timeout()
         try:
             response = future.result()
         except Exception as exc:
             self.get_logger().error(f'{label} service call failed: {exc}')
+            self.publish_service_status(f'{label.upper()}_EXCEPTION: {exc}')
+            if 'pause' in label:
+                self.sm.on_pause_confirmed()
+            elif 'resume' in label:
+                self.sm.on_resume_confirmed()
             return
 
         if not response or not response.success:
             err = response.message if response else 'No response'
-            self.get_logger().warn(f'{label} returned: {err}')
+            if err and ('already' in err.lower() or 'paused' in err.lower()):
+                self.get_logger().info(
+                    f'{label} service acknowledged (already active): {err}'
+                )
+                self.publish_service_status(f'{label.upper()}_ACKNOWLEDGED: {err}')
+                if 'pause' in label:
+                    self.sm.on_pause_confirmed()
+                elif 'resume' in label:
+                    self.sm.on_resume_confirmed()
+                return
+
+            self.get_logger().warn(
+                f'{label} returned non-success: {err}. Proceeding with transition.'
+            )
+            self.publish_service_status(f'{label.upper()}_NON_SUCCESS: {err}')
+            if 'pause' in label:
+                self.sm.on_pause_confirmed()
+            elif 'resume' in label:
+                self.sm.on_resume_confirmed()
             return
 
         self.get_logger().info(f'{label} service succeeded: {response.message}')
+        self.publish_service_status(f'{label.upper()}_SUCCESS: {response.message}')
         if 'pause' in label:
             self.sm.on_pause_confirmed()
         elif 'resume' in label:

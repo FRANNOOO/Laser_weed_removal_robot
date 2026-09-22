@@ -1,0 +1,112 @@
+# ==============================================================================
+# Weed Removal State Machine & Navigation Coordinator Parameters
+# ==============================================================================
+# This configuration file defines all runtime parameters for:
+#   1. state_machine_node   (Arm Cartesian positioning & laser targeting)
+#   2. nav_integration_node (Nav2 pause/resume gating & stop trigger logic)
+#
+# You can modify any value in this file and re-launch:
+#   ros2 launch state_machine state_machine.launch.py
+# Or supply a custom configuration at launch time:
+#   ros2 launch state_machine state_machine.launch.py params_file:=/path/to/params.yaml
+# ==============================================================================
+
+/**:
+  ros__parameters:
+    use_sim_time: true
+
+    # --------------------------------------------------------------------------
+    # Shared Weed Removal Workspace Bounds (robot_base_link frame, in meters)
+    # --------------------------------------------------------------------------
+    workspace_min_x: 0.290       # Front boundary of arm workspace (m)
+    workspace_max_x: 0.400       # Back boundary of arm workspace (m)
+    workspace_min_y: -0.070      # Left lateral reach limit (m)
+    workspace_max_y: 0.070       # Right lateral reach limit (m)
+
+    # --------------------------------------------------------------------------
+    # Shared Weed Queue & Deduplication
+    # --------------------------------------------------------------------------
+    dedup_radius: 0.030          # Spatial deduplication radius for weeds (m)
+    robot_base_frame: "robot_base_link"
+
+    # --------------------------------------------------------------------------
+    # Shared Topics
+    # --------------------------------------------------------------------------
+    approx_weed_topic: "/tracked_weeds"
+    robot_stopped_topic: "/robot_stopped"
+    odom_topic: "/odom"
+
+
+state_machine_node:
+  ros__parameters:
+    # --------------------------------------------------------------------------
+    # Arm Trajectory & Movement Timing
+    # --------------------------------------------------------------------------
+    duration_sec: 2.0            # Duration of Cartesian arm trajectory motion (seconds)
+    laser_duration_us: 500000    # Laser activation duration (microseconds; 500,000 us = 0.5 s)
+
+    # --------------------------------------------------------------------------
+    # Vertical (Z) Workspace Limits & Target Depth (meters)
+    # --------------------------------------------------------------------------
+    enforce_workspace_limits: true
+    workspace_min_z: -0.140      # Lower vertical limit in robot_base_link (m)
+    workspace_max_z: -0.080      # Upper vertical limit in robot_base_link (m)
+    target_z_default: -0.100     # Default vertical targeting depth (m)
+
+    # --------------------------------------------------------------------------
+    # Weeding Mode & Automation
+    # --------------------------------------------------------------------------
+    weeding_enabled: true        # Master toggle for weed treatment execution
+    auto_start_weeding: false    # If true, treats robot as stopped without waiting for /robot_stopped
+
+    # --------------------------------------------------------------------------
+    # Second Camera (Precise Detection) Simulation
+    # --------------------------------------------------------------------------
+    simulate_precise_camera: true
+    precise_offset_x: 0.003      # Simulated Camera 2 X offset residual (m)
+    precise_offset_y: -0.002     # Simulated Camera 2 Y offset residual (m)
+
+    # --------------------------------------------------------------------------
+    # State Machine Watchdogs & Timeouts (seconds)
+    # --------------------------------------------------------------------------
+    detect_timeout_sec: 3.0           # Max wait for precise camera detection before fallback (s)
+    arm_timeout_padding_sec: 5.0      # Safety margin added to duration_sec before arm timeout (s)
+    laser_timeout_padding_sec: 3.0    # Safety margin added to laser_duration before laser timeout (s)
+
+
+nav_integration_node:
+  ros__parameters:
+    # --------------------------------------------------------------------------
+    # Stopping Gating & Timing (Tuned to treat maximum weeds per stop)
+    # --------------------------------------------------------------------------
+    back_edge_margin_x: 0.040    # Distance before back edge to trigger pause (m)
+                                 # Stop threshold: x_trig = workspace_max_x - back_edge_margin_x - (vel_x * stop_delay_sec)
+    stop_delay_sec: 0.80         # Estimated communication + deceleration delay to come to full stop (s)
+    use_velocity_lookahead: true # Dynamically adjust stop trigger position using forward velocity
+
+    # --------------------------------------------------------------------------
+    # Odometry Cooldown Distance
+    # --------------------------------------------------------------------------
+    min_resume_distance_m: 0.05  # Distance robot must travel (m) after resume before stopping again
+
+    # --------------------------------------------------------------------------
+    # Navigation Service Clients & Timeouts
+    # --------------------------------------------------------------------------
+    service_timeout_sec: 5.0     # Max wait for pause/resume service response before proceeding (s)
+    task_timeout_sec: 60.0       # Max wait for weed removal to finish before resuming navigation (s)
+    hold_position_on_pause: true # Continuously publish 0.0 velocity to /cmd_vel during pause
+    mock_nav2: false             # Set true to simulate Nav2 pause/resume services in offline testing
+    provide_start_stop_service: false # If true, hosts /start_stop_robot instead of calling external service
+
+    # --------------------------------------------------------------------------
+    # Navigation Service & Topic Names
+    # --------------------------------------------------------------------------
+    pause_service_name: "/navigate_complete_coverage/pause"
+    resume_service_name: "/navigate_complete_coverage/resume"
+    start_stop_service_name: "/start_stop_robot"
+    cmd_vel_topic: "/cmd_vel"
+    detection_bool_topic: "/weed_detection"
+    weeds_treated_topic: "/state_machine_node/all_weeds_treated"
+    task_done_topic: "/lasering_done"
+    weed_removed_topic: "/state_machine_node/weed_removed"
+
