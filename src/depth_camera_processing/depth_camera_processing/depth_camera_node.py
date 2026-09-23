@@ -68,6 +68,10 @@ class DepthCameraNode(Node):
         self.declare_parameter('yolo_detection_topic', '')
         self.declare_parameter('mock_yolo', False)
         self.declare_parameter('classes_filter', ['weed'])
+        self.declare_parameter('workspace_min_x', 0.290)
+        self.declare_parameter('workspace_max_x', 0.400)
+        self.declare_parameter('workspace_min_y', -0.070)
+        self.declare_parameter('workspace_max_y', 0.070)
 
         # Fallback camera intrinsics in case CameraInfo is delayed or missing
         self.declare_parameter('default_fx', 380.0)
@@ -90,6 +94,10 @@ class DepthCameraNode(Node):
         self._min_depth = float(self.get_parameter('min_valid_depth').value)
         self._max_depth = float(self.get_parameter('max_valid_depth').value)
         self._mock_yolo = bool(self.get_parameter('mock_yolo').value)
+        self._ws_min_x = float(self.get_parameter('workspace_min_x').value)
+        self._ws_max_x = float(self.get_parameter('workspace_max_x').value)
+        self._ws_min_y = float(self.get_parameter('workspace_min_y').value)
+        self._ws_max_y = float(self.get_parameter('workspace_max_y').value)
 
         # Image and intrinsics caching
         self._latest_color_msg: Optional[Image] = None
@@ -206,6 +214,12 @@ class DepthCameraNode(Node):
         if not msg.data:
             return
 
+        if self._is_processing:
+            self.get_logger().debug(
+                'Received trigger_yolo=True while localization already in progress; skipping.'
+            )
+            return
+
         self.get_logger().info(
             f'Received trigger_yolo=True from {self._trigger_topic}. '
             'Activating depth camera weed localization...'
@@ -229,24 +243,29 @@ class DepthCameraNode(Node):
         """
         Execute the full weed localization pipeline.
 
-        1. Check image availability.
-        2. Forward flat RGB image to YOLO model.
-        3. Request inference from YOLO.
-        4. In callback, lookup depth and transform to base frame.
+        1. Check image availability (instant cached dispatch).
+        2. Dispatch detection request to YOLO with goal-acceptance image forwarding.
+        3. In callback, lookup depth and select best candidate within workspace.
+        4. Transform to base frame and publish precise location.
 
         :return: True if process was initiated, False otherwise.
         """
         if self._is_processing:
-            self.get_logger().warn('Localization already in progress; skipping duplicate trigger.')
+            self.get_logger().debug(
+                'Localization already in progress; skipping duplicate trigger.'
+            )
             return False
 
-        import time
-        wait_deadline = time.time() + 3.0
-        while (
-            (self._latest_color_msg is None or self._latest_depth_msg is None)
-            and time.time() < wait_deadline
-        ):
-            time.sleep(0.05)
+        # If cached frames exist, proceed immediately without waiting.
+        # Only if either frame is missing, wait briefly (up to 0.5s).
+        if self._latest_color_msg is None or self._latest_depth_msg is None:
+            import time
+            wait_deadline = time.time() + 0.5
+            while (
+                (self._latest_color_msg is None or self._latest_depth_msg is None)
+                and time.time() < wait_deadline
+            ):
+                time.sleep(0.01)
 
         if self._latest_color_msg is None:
             self.get_logger().error(
@@ -263,18 +282,24 @@ class DepthCameraNode(Node):
         self._is_processing = True
         self._publish_active(True)
 
-        # 1. Forward the flat RGB image to the YOLO model
         color_msg = self._latest_color_msg
-        self._forward_image_pub.publish(color_msg)
-        self.get_logger().info(
-            f'Forwarded RGB image ({color_msg.width}x{color_msg.height}, '
-            f'encoding={color_msg.encoding}) to "{self._forward_topic}".'
-        )
 
-        # 2. Trigger YOLO inference
+        def forward_rgb_image() -> None:
+            """Publish image to YOLO input topic."""
+            self._forward_image_pub.publish(color_msg)
+            self.get_logger().info(
+                f'Forwarded RGB image ({color_msg.width}x{color_msg.height}, '
+                f'encoding={color_msg.encoding}) to "{self._forward_topic}".'
+            )
+
+        # Publish once immediately
+        forward_rgb_image()
+
+        # Trigger YOLO inference, and publish again immediately when goal is accepted by server
         dispatched = self.yolo.request_detection(
             callback=self._on_yolo_detections_received,
             timeout_sec=5.0,
+            on_goal_accepted=forward_rgb_image,
         )
 
         if not dispatched:
@@ -305,66 +330,66 @@ class DepthCameraNode(Node):
                 self._intrinsics if self._intrinsics is not None else self._default_intrinsics
             )
 
-            # If multiple detections, select the one closest to image center
-            best_det = min(
-                detections,
-                key=lambda d: (d.u - cx) ** 2 + (d.v - cy) ** 2,
-            )
-
-            self.get_logger().info(
-                f'Selected weed candidate at pixel ({best_det.u:.1f}, {best_det.v:.1f}) '
-                f'[size: {best_det.width:.0f}x{best_det.height:.0f}, '
-                f'conf={best_det.confidence:.2f}].'
-            )
-
-            # 3. Decode depth image and extract depth at pixel
             depth_msg = self._latest_depth_msg
             if depth_msg is None:
                 self.get_logger().error('Depth image was lost during processing.')
                 return
 
             depth_array = decode_depth_image(depth_msg, depth_scale=self._depth_scale)
-            depth_m = get_depth_at_pixel(
-                depth_array,
-                u=best_det.u,
-                v=best_det.v,
-                window_size=self._window_size,
-                min_depth=self._min_depth,
-                max_depth=self._max_depth,
-            )
+            optical_frame = depth_msg.header.frame_id or self._camera_frame
 
-            if depth_m is None:
+            # Evaluate candidate detections
+            candidates = []
+            for det in detections:
+                depth_val = get_depth_at_pixel(
+                    depth_array,
+                    u=det.u,
+                    v=det.v,
+                    window_size=self._window_size,
+                    min_depth=self._min_depth,
+                    max_depth=self._max_depth,
+                )
+                if depth_val is None:
+                    continue
+
+                xc, yc, zc = pixel_to_3d_camera_frame(
+                    det.u, det.v, depth_val, fx, fy, cx, cy
+                )
+                pt, pose = self._transform_to_target_frame(
+                    xc, yc, zc, source_frame=optical_frame, stamp=depth_msg.header.stamp
+                )
+                in_ws = (
+                    self._ws_min_x <= pt.x <= self._ws_max_x
+                    and self._ws_min_y <= pt.y <= self._ws_max_y
+                )
+                center_dist_sq = (det.u - cx) ** 2 + (det.v - cy) ** 2
+                candidates.append((in_ws, center_dist_sq, det, depth_val, xc, yc, zc, pt, pose))
+
+            if not candidates:
                 self.get_logger().error(
-                    f'Could not retrieve valid depth at pixel '
-                    f'({best_det.u:.1f}, {best_det.v:.1f}) within '
-                    f'window {self._window_size}x{self._window_size}.'
+                    f'Could not retrieve valid depth for any of {len(detections)} candidate(s).'
                 )
                 return
 
+            # Prioritize candidates within the workspace, then closest to center
+            candidates.sort(key=lambda c: (not c[0], c[1]))
+            _, _, best_det, depth_m, x_cam, y_cam, z_cam, precise_pt, precise_pose = candidates[0]
+
             self.get_logger().info(
-                f'Found depth at pixel ({best_det.u:.1f}, {best_det.v:.1f}): {depth_m:.4f} m '
-                f'({depth_m*1000.0:.1f} mm).'
+                f'Selected weed candidate at pixel ({best_det.u:.1f}, {best_det.v:.1f}) '
+                f'[size: {best_det.width:.0f}x{best_det.height:.0f}, '
+                f'conf={best_det.confidence:.2f}, depth={depth_m:.4f}m].'
             )
 
             # Publish pixel + depth debug
             uv_msg = Point(x=float(best_det.u), y=float(best_det.v), z=float(depth_m))
             self._detected_uv_pub.publish(uv_msg)
 
-            # 4. Project (u, v, Z) into 3D camera frame
-            x_cam, y_cam, z_cam = pixel_to_3d_camera_frame(
-                best_det.u, best_det.v, depth_m, fx, fy, cx, cy
-            )
             self.get_logger().info(
                 f'Projected 3D camera coordinates: ({x_cam:.4f}, {y_cam:.4f}, {z_cam:.4f}) m.'
             )
 
-            # 5. Transform 3D coordinates to target frame (robot_base_link)
-            optical_frame = depth_msg.header.frame_id or self._camera_frame
-            precise_pt, precise_pose = self._transform_to_target_frame(
-                x_cam, y_cam, z_cam, source_frame=optical_frame, stamp=depth_msg.header.stamp
-            )
-
-            # 6. Publish precise location to State Machine
+            # Publish precise location to State Machine
             self._precise_loc_pub.publish(precise_pt)
             self._precise_pose_pub.publish(precise_pose)
 

@@ -79,6 +79,7 @@ class YoloClient:
 
         self._action_client: Optional[ActionClient] = None
         self._active_callback: Optional[Callable[[List[WeedDetection]], None]] = None
+        self._on_goal_accepted: Optional[Callable[[], None]] = None
         self._topic_sub = None
 
         if not self._mock_mode and YOLO_ACTION_AVAILABLE and Detection is not None:
@@ -99,6 +100,7 @@ class YoloClient:
                 detection_topic,
                 self._detection_topic_callback,
                 10,
+                callback_group=callback_group,
             )
             self._logger.info(
                 f'YoloClient subscribed to detection topic: "{detection_topic}"'
@@ -116,6 +118,7 @@ class YoloClient:
         callback: Callable[[List[WeedDetection]], None],
         timeout_sec: float = 3.0,
         mock_weed_uv: Optional[tuple] = None,
+        on_goal_accepted: Optional[Callable[[], None]] = None,
     ) -> bool:
         """
         Trigger YOLO weed detection.
@@ -123,12 +126,19 @@ class YoloClient:
         :param callback: Function called with List[WeedDetection] once inference completes.
         :param timeout_sec: Maximum time to wait for action server if connecting.
         :param mock_weed_uv: Optional (u, v) tuple to return in mock mode.
+        :param on_goal_accepted: Optional callback invoked immediately after goal is accepted.
         :return: True if detection request was dispatched, False otherwise.
         """
         self._active_callback = callback
+        self._on_goal_accepted = on_goal_accepted
 
         if self._mock_mode or self._action_client is None:
             self._logger.info('YoloClient running in mock/offline detection mode.')
+            if on_goal_accepted is not None:
+                try:
+                    on_goal_accepted()
+                except Exception as ex:
+                    self._logger.error(f'Error in mock on_goal_accepted callback: {ex}')
             u = 320.0 if mock_weed_uv is None else float(mock_weed_uv[0])
             v = 240.0 if mock_weed_uv is None else float(mock_weed_uv[1])
             detections = [
@@ -166,6 +176,12 @@ class YoloClient:
                 self._logger.warning('YOLO detection goal was rejected by server.')
                 self._dispatch_results([])
                 return
+
+            if self._on_goal_accepted is not None:
+                try:
+                    self._on_goal_accepted()
+                except Exception as ex:
+                    self._logger.error(f'Error executing on_goal_accepted: {ex}')
 
             res_future = goal_handle.get_result_async()
             res_future.add_done_callback(self._on_action_result)
@@ -235,6 +251,7 @@ class YoloClient:
 
     def _dispatch_results(self, detections: List[WeedDetection]) -> None:
         """Send detections to the registered callback."""
+        self._on_goal_accepted = None
         cb = self._active_callback
         self._active_callback = None
         if cb is not None:

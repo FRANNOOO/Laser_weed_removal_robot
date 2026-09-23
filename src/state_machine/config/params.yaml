@@ -42,7 +42,8 @@ state_machine_node:
     # --------------------------------------------------------------------------
     # Arm Trajectory & Movement Timing
     # --------------------------------------------------------------------------
-    duration_sec: 2.0            # Duration of Cartesian arm trajectory motion (seconds)
+    duration_sec: 2.0            # Duration of gross Cartesian arm motion to approx_loc (seconds)
+    duration_precise_sec: 0.8    # Duration of fine Cartesian arm motion to precise_loc (seconds)
     laser_duration_us: 500000    # Laser activation duration (microseconds; 500,000 us = 0.5 s)
 
     # --------------------------------------------------------------------------

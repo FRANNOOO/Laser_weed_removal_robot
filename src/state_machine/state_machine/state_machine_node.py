@@ -79,9 +79,13 @@ class StateMachineNode(Node):
         self.declare_parameter('laser_timeout_padding_sec', 3.0)
         self.declare_parameter('dedup_radius', 0.03)
         self.declare_parameter('weeding_enabled', True)
+        self.declare_parameter('duration_precise_sec', 0.8)
 
         # Read parameters
         self._duration_sec = float(self.get_parameter('duration_sec').value)
+        self._duration_precise_sec = float(
+            self.get_parameter('duration_precise_sec').value
+        )
         self._laser_duration_us = int(
             self.get_parameter('laser_duration_us').value
         )
@@ -713,9 +717,9 @@ class StateMachineNode(Node):
             if res.success:
                 self.get_logger().info(f'Depth camera localization acknowledged: {res.message}')
             else:
-                self.get_logger().warn(f'Depth camera localization returned false: {res.message}')
+                self.get_logger().debug(f'Depth camera localization response: {res.message}')
         except Exception as e:
-            self.get_logger().warn(f'Error calling trigger_localization service: {e}')
+            self.get_logger().debug(f'trigger_localization service call: {e}')
 
     def _on_detect_precise_timeout(self) -> None:
         """Handle Camera 2 detection timeout by falling back to approx location."""
@@ -942,13 +946,37 @@ class StateMachineNode(Node):
         self._precise_loc = target
         self._set_state(State.MOVE_TO_PRECISE)
 
+        ws_min = self.arm.workspace_min
+        ws_max = self.arm.workspace_max
         valid, reason = self.arm.check_workspace(target.x, target.y, target.z)
         if not valid:
-            self._on_weed_treatment_failed(
-                f'Precise target ({target.x:.3f}, {target.y:.3f}, {target.z:.3f}) '
-                f'outside workspace: {reason}'
-            )
-            return
+            # Allow clamping for targets within a small tolerance margin (e.g. 3.5cm)
+            margin = 0.035
+            can_clamp_x = (ws_min[0] - margin <= target.x <= ws_max[0] + margin)
+            can_clamp_y = (ws_min[1] - margin <= target.y <= ws_max[1] + margin)
+            if can_clamp_x and can_clamp_y:
+                clamped_x = min(max(target.x, ws_min[0]), ws_max[0])
+                clamped_y = min(max(target.y, ws_min[1]), ws_max[1])
+                self.get_logger().info(
+                    f'Precise target ({target.x:.3f}, {target.y:.3f}) slightly outside '
+                    f'workspace; clamped to ({clamped_x:.3f}, {clamped_y:.3f})'
+                )
+                target = Point(x=clamped_x, y=clamped_y, z=target.z)
+                self._precise_loc = target
+            elif self._approx_loc is not None:
+                self.get_logger().warn(
+                    f'Precise target ({target.x:.3f}, {target.y:.3f}) outside '
+                    f'workspace ({reason}); falling back to approx_loc '
+                    f'({self._approx_loc.x:.3f}, {self._approx_loc.y:.3f})'
+                )
+                target = self._approx_loc
+                self._precise_loc = target
+            else:
+                self._on_weed_treatment_failed(
+                    f'Precise target ({target.x:.3f}, {target.y:.3f}, {target.z:.3f}) '
+                    f'outside workspace: {reason}'
+                )
+                return
 
         self._publish_flag(self._arm_send_goal_pub, True)
         self.get_logger().info(
@@ -976,9 +1004,10 @@ class StateMachineNode(Node):
             )
             self._enter_lasering()
 
+        duration = self._duration_precise_sec
         sent = self.arm.move_to_position(
             target.x, target.y, target.z,
-            duration_sec=self._duration_sec,
+            duration_sec=duration,
             result_callback=on_precise_move_done,
         )
         self._publish_flag(self._arm_send_goal_pub, False)
@@ -986,7 +1015,7 @@ class StateMachineNode(Node):
             self._on_weed_treatment_failed('Failed to send goal to precise_loc')
             return
 
-        arm_timeout = self._duration_sec + self._arm_timeout_padding_sec
+        arm_timeout = duration + self._arm_timeout_padding_sec
         self._arm_watchdog_timer = self.create_timer(
             arm_timeout, self._on_arm_timeout
         )
@@ -1152,7 +1181,7 @@ class StateMachineNode(Node):
         :param msg: Precise Point coordinates.
         """
         if self._state != State.DETECT_PRECISE:
-            self.get_logger().warn(
+            self.get_logger().debug(
                 f'Ignoring yolo_done: machine in state {self._state.value} '
                 '(expected Detect_Precise)'
             )
