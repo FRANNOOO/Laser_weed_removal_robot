@@ -65,6 +65,7 @@ class CartesianActionClient:
 
         self._goal_handle: Optional[ClientGoalHandle] = None
         self._is_moving: bool = False
+        self._controllers_ready: bool = False
 
         if HAS_JAETROBI_MSGS and FollowCartesianTrajectory is not None:
             self._client: Optional[ActionClient] = ActionClient(
@@ -100,6 +101,11 @@ class CartesianActionClient:
             f'y=[{self.workspace_min[1]:.3f}, {self.workspace_max[1]:.3f}], '
             f'z=[{self.workspace_min[2]:.3f}, {self.workspace_max[2]:.3f}]'
         )
+
+    @property
+    def is_controllers_ready(self) -> bool:
+        """Return True if required controllers are confirmed active."""
+        return self._controllers_ready
 
     @property
     def is_moving(self) -> bool:
@@ -213,17 +219,22 @@ class CartesianActionClient:
             self._logger.debug(f'Could not list controllers: {e}')
             return
 
-        required = ['jaetrobi_controller', 'joint_trajectory_controller']
+        required = [
+            'joint_state_broadcaster',
+            'jaetrobi_controller',
+            'joint_trajectory_controller',
+        ]
         active_controllers = {
             c.name for c in response.controller if c.state == 'active'
         }
         to_activate = [c for c in required if c not in active_controllers]
 
-        if (
-            to_activate and
-            self._switch_controller_client and
-            self._switch_controller_client.service_is_ready()
-        ):
+        if not to_activate:
+            self._logger.info('All required arm controllers are active.')
+            self._controllers_ready = True
+            return
+
+        def _do_switch() -> None:
             self._logger.info(
                 f'Controllers {to_activate} inactive. Activating...'
             )
@@ -231,17 +242,44 @@ class CartesianActionClient:
             switch_req.activate_controllers = to_activate
             switch_req.deactivate_controllers = []
             switch_req.strictness = SwitchController.Request.BEST_EFFORT
-            switch_req.activate_asap = False
+            switch_req.activate_asap = True
             switch_req.timeout = MsgDuration(sec=1, nanosec=0)
             switch_future = self._switch_controller_client.call_async(
                 switch_req
             )
-            switch_future.add_done_callback(
-                lambda f: self._logger.info(
-                    f'Controller activation result: '
-                    f'{f.result().ok if f.result() else False}'
-                )
+
+            def _on_switch_done(f: Future) -> None:
+                try:
+                    res = f.result()
+                    ok = res.ok if res else False
+                    self._logger.info(f'Controller activation result: {ok}')
+                    if ok:
+                        self._controllers_ready = True
+                except Exception as ex:
+                    self._logger.error(f'SwitchController call failed: {ex}')
+
+            switch_future.add_done_callback(_on_switch_done)
+
+        if (
+            self._switch_controller_client and
+            self._switch_controller_client.service_is_ready()
+        ):
+            _do_switch()
+        elif self._switch_controller_client:
+            self._logger.info(
+                'Waiting for /controller_manager/switch_controller service...'
             )
+            switch_retry_timer = None
+
+            def _check_switch_and_call() -> None:
+                nonlocal switch_retry_timer
+                if self._switch_controller_client.service_is_ready():
+                    if switch_retry_timer is not None:
+                        switch_retry_timer.cancel()
+                        switch_retry_timer = None
+                    _do_switch()
+
+            switch_retry_timer = self._node.create_timer(1.0, _check_switch_and_call)
 
     def move_to_position(
         self,
@@ -263,6 +301,9 @@ class CartesianActionClient:
         :param result_callback: Optional callback when goal finishes.
         :return: True if goal was validated and sent, False otherwise.
         """
+        if not self._controllers_ready:
+            self.check_and_activate_controllers_async()
+
         valid, reason = self.check_workspace(x, y, z)
         if not valid:
             self._logger.error(
@@ -294,7 +335,7 @@ class CartesianActionClient:
 
         def internal_feedback(feedback_msg):
             pos = feedback_msg.feedback.actual.pose.position
-            self._logger.info(
+            self._logger.debug(
                 f'Trajectory progress: current position = '
                 f'({pos.x:.4f}, {pos.y:.4f}, {pos.z:.4f})'
             )
@@ -310,6 +351,8 @@ class CartesianActionClient:
             goal_handle: Optional[ClientGoalHandle] = future.result()
             if not goal_handle or not goal_handle.accepted:
                 self._logger.error('Cartesian trajectory goal was REJECTED by action server.')
+                self._controllers_ready = False
+                self.check_and_activate_controllers_async()
                 self._is_moving = False
                 if result_callback:
                     result_callback(None)
@@ -330,6 +373,8 @@ class CartesianActionClient:
                 elif status == 6:
                     msg_text = res.result.msg if res and res.result else 'aborted'
                     self._logger.error(f'Cartesian trajectory motion ABORTED: {msg_text}')
+                    self._controllers_ready = False
+                    self.check_and_activate_controllers_async()
                 else:
                     self._logger.warn(f'Cartesian trajectory finished with status: {status}')
 

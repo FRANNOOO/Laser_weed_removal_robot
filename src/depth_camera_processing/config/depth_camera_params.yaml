@@ -1,0 +1,76 @@
+# ==============================================================================
+# Depth Camera (Intel RealSense D405) Weed Localization Parameters
+# ==============================================================================
+
+depth_camera_node:
+  ros__parameters:
+    use_sim_time: false
+
+    # --------------------------------------------------------------------------
+    # RealSense D405 Camera Topics
+    # --------------------------------------------------------------------------
+    # RGB color image stream
+    color_image_topic: "/camera_endeffector/color/image_raw"
+
+    # Aligned depth image stream (or /camera_endeffector/depth/image_rect_raw)
+    depth_image_topic: "/camera_endeffector/aligned_depth_to_color/image_raw"
+
+    # Camera intrinsic calibration info
+    camera_info_topic: "/camera_endeffector/color/camera_info"
+
+    # --------------------------------------------------------------------------
+    # YOLO Interface Topics & Forwarding
+    # --------------------------------------------------------------------------
+    # Topic on which YOLO expects the forwarded flat RGB image
+    yolo_image_forward_topic: "/camera_endeffector/image_raw"
+
+    # Action server name for triggering YOLO detection
+    yolo_action_name: "yolo_detect"
+
+    # Optional topic for listening to detections directly
+    yolo_detection_topic: ""
+
+    # Class filter (labels of weeds to target)
+    classes_filter: ["weed", "meristem"]
+
+    # --------------------------------------------------------------------------
+    # State Machine Integration Topics
+    # --------------------------------------------------------------------------
+    # Trigger signal from state machine when arm arrives at approx position
+    trigger_topic: "/state_machine_node/trigger_yolo"
+
+    # Target topic to publish precise 3D position to advance state machine
+    precise_location_topic: "/state_machine_node/precise_location"
+    precise_location_pose_topic: "/state_machine_node/precise_location_pose"
+
+    # --------------------------------------------------------------------------
+    # Coordinate Frames
+    # --------------------------------------------------------------------------
+    camera_optical_frame: "camera_endeffector_optical_link"
+    target_frame: "robot_base_link"
+
+    # --------------------------------------------------------------------------
+    # Depth Image Decoding & Filtering
+    # --------------------------------------------------------------------------
+    # Conversion scale for 16UC1 depth format (0.001 = 1 mm per unit)
+    depth_scale: 0.001
+
+    # Local neighborhood median filter window size (odd integer, e.g. 3 or 5)
+    # Replaces 0/dropout/shadow pixels with median of neighboring valid pixels
+    depth_window_size: 3
+
+    # Valid depth range in meters (D405 operating range is 0.07m to 0.50m)
+    min_valid_depth: 0.02
+    max_valid_depth: 1.20
+
+    # --------------------------------------------------------------------------
+    # Simulation / Offline Testing
+    # --------------------------------------------------------------------------
+    mock_yolo: false
+
+    # Fallback pinhole camera intrinsics in case CameraInfo topic is delayed
+    default_fx: 380.0
+    default_fy: 380.0
+    default_cx: 320.0
+    default_cy: 240.0
+

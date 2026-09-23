@@ -17,7 +17,7 @@
 	"containerEnv": {
 		"RMW_IMPLEMENTATION": "rmw_zenoh_cpp",
 		"ROS_DOMAIN_ID": "0",
-		"ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST"
+		"ZENOH_SESSION_CONFIG_URI": "/workspace/config_zenoh_session.json5"
 	},
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],

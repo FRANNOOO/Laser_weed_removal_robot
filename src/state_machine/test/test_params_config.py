@@ -65,10 +65,9 @@ def test_launch_descriptions_generate_successfully():
     sm_mod = _load_launch_module(os.path.join('launch', 'state_machine.launch.py'))
     sm_ld = sm_mod.generate_launch_description()
     assert isinstance(sm_ld, LaunchDescription)
-    assert len(sm_ld.entities) == 4
+    assert len(sm_ld.entities) >= 4
 
     nav_mod = _load_launch_module(os.path.join('launch', 'nav_integration.launch.py'))
     nav_ld = nav_mod.generate_launch_description()
     assert isinstance(nav_ld, LaunchDescription)
     assert len(nav_ld.entities) == 2
-

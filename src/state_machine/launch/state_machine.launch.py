@@ -29,6 +29,12 @@ def generate_launch_description() -> LaunchDescription:
         description='Whether to launch the Nav2 navigation coordinator node'
     )
 
+    launch_depth_camera_arg = DeclareLaunchArgument(
+        'launch_depth_camera',
+        default_value='false',
+        description='Whether to launch the RealSense D405 depth camera processing node'
+    )
+
     state_machine_node = Node(
         package='state_machine',
         executable='state_machine_node',
@@ -46,9 +52,20 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[LaunchConfiguration('params_file')]
     )
 
+    depth_camera_node = Node(
+        package='depth_camera_processing',
+        executable='depth_camera_node',
+        name='depth_camera_node',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('launch_depth_camera')),
+        parameters=[LaunchConfiguration('params_file')]
+    )
+
     return LaunchDescription([
         params_file_arg,
         launch_nav_integration_arg,
+        launch_depth_camera_arg,
         state_machine_node,
         nav_integration_node,
+        depth_camera_node,
     ])

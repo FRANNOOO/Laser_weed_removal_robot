@@ -23,7 +23,7 @@ from state_machine.action_client_arm_control import CartesianActionClient
 from state_machine.action_client_laser import ActionClientLaser
 from state_machine.weed_queue_manager import QueuedWeed, WeedQueueManager
 from std_msgs.msg import Bool, Int32, String
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 import tf2_geometry_msgs  # noqa: F401
 from tf2_ros import Buffer, TransformListener
 
@@ -225,6 +225,12 @@ class StateMachineNode(Node):
         )
         self.get_logger().info('Hosting service /start_stop_weeding (SetBool)')
 
+        # Client for Depth Camera localization trigger service
+        self._trigger_localization_client = self.create_client(
+            Trigger,
+            '/depth_camera_node/trigger_localization',
+        )
+
         if CUSTOM_MSGS_AVAILABLE:
             self._weed_burned_pub = self.create_publisher(
                 Weed, '/weed_burned', 10
@@ -323,11 +329,12 @@ class StateMachineNode(Node):
         return self._state
 
     def _check_controllers_timer_callback(self) -> None:
-        """Ensure controllers are activated on node start."""
-        if self._check_controllers_timer:
-            self._check_controllers_timer.cancel()
-            self._check_controllers_timer = None
+        """Ensure controllers are activated on node start and retry until active."""
         self.arm.check_and_activate_controllers_async()
+        if self.arm.is_controllers_ready:
+            if self._check_controllers_timer:
+                self._check_controllers_timer.cancel()
+                self._check_controllers_timer = None
 
     def _start_stop_weeding_callback(
         self, request: SetBool.Request, response: SetBool.Response
@@ -448,6 +455,14 @@ class StateMachineNode(Node):
             # resume navigation instead of waiting for the watchdog
             # timeout.
             if self._robot_stopped:
+                # Purge weeds that have permanently overshot the arm workspace
+                purged = self.queue_mgr.purge_unreachable(self.arm.workspace_max[0])
+                if purged > 0:
+                    self.get_logger().info(
+                        f'Purged {purged} overshot weed(s) with '
+                        f'x > {self.arm.workspace_max[0]:.3f}m.'
+                    )
+                    self._publish_queue_size()
                 self.get_logger().info(
                     'Robot stopped but no reachable weeds. '
                     'Publishing all_weeds_treated=True to resume nav.'
@@ -691,9 +706,21 @@ class StateMachineNode(Node):
             self._laser_watchdog_timer.cancel()
             self._laser_watchdog_timer = None
 
+    def _on_trigger_localization_response(self, future) -> None:
+        """Handle response from /depth_camera_node/trigger_localization service."""
+        try:
+            res = future.result()
+            if res.success:
+                self.get_logger().info(f'Depth camera localization acknowledged: {res.message}')
+            else:
+                self.get_logger().warn(f'Depth camera localization returned false: {res.message}')
+        except Exception as e:
+            self.get_logger().warn(f'Error calling trigger_localization service: {e}')
+
     def _on_detect_precise_timeout(self) -> None:
         """Handle Camera 2 detection timeout by falling back to approx location."""
         self._cancel_detect_watchdog()
+        self._publish_flag(self._trigger_yolo_pub, False)
         if self._state != State.DETECT_PRECISE:
             return
         if self._approx_loc is None:
@@ -826,7 +853,20 @@ class StateMachineNode(Node):
         self.get_logger().info(
             'Detect_Precise: trigger_yolo=True (awaiting [yolo_done])'
         )
-        self._publish_flag(self._trigger_yolo_pub, False)
+
+        # Trigger Camera 2 localization via direct service call if available
+        client_ready = (
+            hasattr(self, '_trigger_localization_client')
+            and self._trigger_localization_client.service_is_ready()
+        )
+        if client_ready:
+            self.get_logger().info('Calling /depth_camera_node/trigger_localization service...')
+            future = self._trigger_localization_client.call_async(Trigger.Request())
+            future.add_done_callback(self._on_trigger_localization_response)
+        else:
+            self.get_logger().debug(
+                '/depth_camera_node/trigger_localization not ready; topic flag used.'
+            )
 
         if self._precise_sim_timer is not None:
             self._precise_sim_timer.cancel()
@@ -888,6 +928,7 @@ class StateMachineNode(Node):
         """
         self._cancel_detect_watchdog()
         self._cancel_arm_watchdog()
+        self._publish_flag(self._trigger_yolo_pub, False)
 
         # Clamp Z to valid arm workspace range (same rationale as
         # _enter_approx_loc).

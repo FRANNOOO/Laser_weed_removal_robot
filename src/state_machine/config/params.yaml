@@ -62,16 +62,55 @@ state_machine_node:
     # --------------------------------------------------------------------------
     # Second Camera (Precise Detection) Simulation
     # --------------------------------------------------------------------------
-    simulate_precise_camera: true
+    # When using real/simulated depth camera node (depth_camera_processing),
+    # set simulate_precise_camera to false so state_machine_node waits for
+    # real precise 3D detections on /state_machine_node/precise_location.
+    simulate_precise_camera: false
     precise_offset_x: 0.003      # Simulated Camera 2 X offset residual (m)
     precise_offset_y: -0.002     # Simulated Camera 2 Y offset residual (m)
 
     # --------------------------------------------------------------------------
     # State Machine Watchdogs & Timeouts (seconds)
     # --------------------------------------------------------------------------
-    detect_timeout_sec: 3.0           # Max wait for precise camera detection before fallback (s)
+    detect_timeout_sec: 5.0           # Max wait for precise camera detection before fallback (s)
     arm_timeout_padding_sec: 5.0      # Safety margin added to duration_sec before arm timeout (s)
     laser_timeout_padding_sec: 3.0    # Safety margin added to laser_duration before laser timeout (s)
+
+
+depth_camera_node:
+  ros__parameters:
+    # --------------------------------------------------------------------------
+    # RealSense D405 Camera Topics
+    # --------------------------------------------------------------------------
+    color_image_topic: "/camera_endeffector/color/image_raw"
+    depth_image_topic: "/camera_endeffector/aligned_depth_to_color/image_raw"
+    camera_info_topic: "/camera_endeffector/color/camera_info"
+
+    # --------------------------------------------------------------------------
+    # YOLO Interface & Image Forwarding
+    # --------------------------------------------------------------------------
+    yolo_image_forward_topic: "/camera_endeffector/image_raw"
+    yolo_action_name: "yolo_detect"
+    yolo_detection_topic: ""
+    mock_yolo: false
+    classes_filter: ["0", "4", "weed", "meristem"]
+
+    # --------------------------------------------------------------------------
+    # State Machine Integration Topics & Frames
+    # --------------------------------------------------------------------------
+    trigger_topic: "/state_machine_node/trigger_yolo"
+    precise_location_topic: "/state_machine_node/precise_location"
+    precise_location_pose_topic: "/state_machine_node/precise_location_pose"
+    camera_optical_frame: "camera_endeffector_optical_link"
+    target_frame: "robot_base_link"
+
+    # --------------------------------------------------------------------------
+    # Depth Image Decoding & Filtering
+    # --------------------------------------------------------------------------
+    depth_scale: 0.001           # Conversion factor for 16UC1 (1 mm = 0.001 m)
+    depth_window_size: 3         # Median window size for handling dropouts/shadows
+    min_valid_depth: 0.02        # Min valid depth (m)
+    max_valid_depth: 1.20        # Max valid depth (m)
 
 
 nav_integration_node:
@@ -81,7 +120,7 @@ nav_integration_node:
     # --------------------------------------------------------------------------
     back_edge_margin_x: 0.040    # Distance before back edge to trigger pause (m)
                                  # Stop threshold: x_trig = workspace_max_x - back_edge_margin_x - (vel_x * stop_delay_sec)
-    stop_delay_sec: 0.80         # Estimated communication + deceleration delay to come to full stop (s)
+    stop_delay_sec: 0.35         # Calibrated communication + deceleration delay to come to full stop (s)
     use_velocity_lookahead: true # Dynamically adjust stop trigger position using forward velocity
 
     # --------------------------------------------------------------------------

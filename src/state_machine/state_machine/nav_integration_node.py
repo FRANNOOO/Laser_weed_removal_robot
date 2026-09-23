@@ -148,7 +148,7 @@ class NavigationCoordinatorStateMachine:
 
         x_trigger = x_target - lookahead
         # Clamp within observable range before workspace back edge
-        min_trigger_x = 0.150
+        min_trigger_x = getattr(self.node, 'min_trigger_x', 0.150)
         return max(min_trigger_x, min(x_trigger, self.node.workspace_max_x))
 
     def check_back_edge_trigger(self) -> Tuple[bool, Optional[float], float]:
@@ -247,7 +247,7 @@ class NavigationCoordinatorStateMachine:
             current_pose,
         )
         self.node.queue_mgr.purge_unreachable(
-            self.node.workspace_max_x + 0.15
+            self.node.workspace_max_x + 0.04
         )
 
         # Telemetry: publish trigger_x and oldest_weed_x on every odom update
@@ -804,25 +804,7 @@ class NavigationCoordinatorNode(Node):
 
         pause_triggered = False
 
-        # Try SetBool client (/start_stop_robot) first if available
-        if not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
-            pause_triggered = True
-            self.get_logger().info(
-                f'Calling {self.start_stop_service_name} (SetBool data=False)...'
-            )
-            req_bool = SetBool.Request()
-            req_bool.data = False
-            try:
-                future_bool = self.start_stop_client.call_async(req_bool)
-                future_bool.add_done_callback(
-                    lambda f: self._on_set_bool_response(f, 'start_stop_pause')
-                )
-            except Exception as ex:
-                self.get_logger().error(
-                    f'Failed to send {self.start_stop_service_name} request: {ex}'
-                )
-
-        # Also try Trigger client (/navigate_complete_coverage/pause) if available
+        # Prioritize direct Nav2 coverage pause client (/navigate_complete_coverage/pause)
         if self.pause_client.service_is_ready():
             pause_triggered = True
             self.get_logger().info(
@@ -837,6 +819,23 @@ class NavigationCoordinatorNode(Node):
             except Exception as ex:
                 self.get_logger().error(
                     f'Failed to send {self.pause_service_name} request: {ex}'
+                )
+        elif not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
+            # Fallback to SetBool client (/start_stop_robot) if coverage client is unavailable
+            pause_triggered = True
+            self.get_logger().info(
+                f'Calling {self.start_stop_service_name} (SetBool data=False)...'
+            )
+            req_bool = SetBool.Request()
+            req_bool.data = False
+            try:
+                future_bool = self.start_stop_client.call_async(req_bool)
+                future_bool.add_done_callback(
+                    lambda f: self._on_set_bool_response(f, 'start_stop_pause')
+                )
+            except Exception as ex:
+                self.get_logger().error(
+                    f'Failed to send {self.start_stop_service_name} request: {ex}'
                 )
 
         if pause_triggered:
@@ -860,25 +859,7 @@ class NavigationCoordinatorNode(Node):
 
         resume_triggered = False
 
-        # Try SetBool client (/start_stop_robot) first if available
-        if not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
-            resume_triggered = True
-            self.get_logger().info(
-                f'Calling {self.start_stop_service_name} (SetBool data=True)...'
-            )
-            req_bool = SetBool.Request()
-            req_bool.data = True
-            try:
-                future_bool = self.start_stop_client.call_async(req_bool)
-                future_bool.add_done_callback(
-                    lambda f: self._on_set_bool_response(f, 'start_stop_resume')
-                )
-            except Exception as ex:
-                self.get_logger().error(
-                    f'Failed to send {self.start_stop_service_name} request: {ex}'
-                )
-
-        # Also try Trigger client (/navigate_complete_coverage/resume) if available
+        # Prioritize direct Nav2 coverage resume client (/navigate_complete_coverage/resume)
         if self.resume_client.service_is_ready():
             resume_triggered = True
             self.get_logger().info(
@@ -893,6 +874,23 @@ class NavigationCoordinatorNode(Node):
             except Exception as ex:
                 self.get_logger().error(
                     f'Failed to send {self.resume_service_name} request: {ex}'
+                )
+        elif not self.provide_start_stop_service and self.start_stop_client.service_is_ready():
+            # Fallback to SetBool client (/start_stop_robot) if coverage client is unavailable
+            resume_triggered = True
+            self.get_logger().info(
+                f'Calling {self.start_stop_service_name} (SetBool data=True)...'
+            )
+            req_bool = SetBool.Request()
+            req_bool.data = True
+            try:
+                future_bool = self.start_stop_client.call_async(req_bool)
+                future_bool.add_done_callback(
+                    lambda f: self._on_set_bool_response(f, 'start_stop_resume')
+                )
+            except Exception as ex:
+                self.get_logger().error(
+                    f'Failed to send {self.start_stop_service_name} request: {ex}'
                 )
 
         if resume_triggered:
@@ -1075,6 +1073,7 @@ class NavigationCoordinatorNode(Node):
     def _on_all_weeds_treated(self, msg: Bool) -> None:
         """Handle completion signal from weed removal state machine."""
         if msg.data:
+            self.queue_mgr.purge_unreachable(self.workspace_max_x)
             self.sm.on_task_done()
 
     def _on_weed_removed(self, msg: Int32) -> None:
