@@ -1,6 +1,6 @@
 # Bootcamp 2026
 
-In this repositorie is the code from 2026 Robotics Bootcamp Laser weeding team
+In this repositoriy is the code from 2026 Robotics Bootcamp Laser weeding team
 
 ## Branches
 
