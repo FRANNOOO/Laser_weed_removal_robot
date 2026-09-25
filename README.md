@@ -1,18 +1,15 @@
-# Template App
+# Bootcamp 2026
 
-This repository serves as a template application. 
+In this repositorie is the code from 2026 Robotics Bootcamp Laser weeding team
 
-## Setting up project
+## Branches
 
-1. Make a global search for app_template and replace with your name
-2. Update dependencies either inside the dockerfiles (root folder and .devcontainer)
-3. Place your application launch files in src/launch
-4. You can add any required ros package (e.g. via submodule), in the src folder. 
+In branch working_state is the last tested working code for robot without feature for depth camera (is is dummied and brodcasted on precise localization topic)
 
-## Devcontainer
+In branch realsense is the last tested working (but not yet optimalized) code featureing depth camera usage
 
-The devcontainer can be used with vscode (https://code.visualstudio.com/docs/devcontainers/containers). This way makes it very easy to set up the development environment. 
+## About
 
-## Dockerfile
+By Rachel Yayra Adjoe, Nicola Genovese and Freanciszek Bonislawski
+With help of Daniel Suhr
 
-The dockerfile is used to build the application container. 
