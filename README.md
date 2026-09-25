@@ -11,5 +11,6 @@ In branch realsense is the last tested working (but not yet optimalized) code fe
 ## About
 
 By Rachel Yayra Adjoe, Nicola Genovese and Freanciszek Bonislawski
+
 With help of Daniel Suhr
 
